@@ -1,0 +1,11 @@
+services:
+  minirouter:
+    build:
+      context: .
+    image: minirouter:local
+    ports:
+      - "8080:8080"
+    environment:
+      MINIROUTER_CONFIG: /config/config.json
+    volumes:
+      - ./config.json:/config/config.json:ro

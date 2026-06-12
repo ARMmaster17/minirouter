@@ -1,0 +1,145 @@
+{
+  "server": {
+    "addr": ":8080",
+    "frontendEnabled": true,
+    "incomingAPIKey": "replace-with-shared-client-key"
+  },
+  "providers": [
+    {
+      "kind": "openai",
+      "name": "openai",
+      "apiKey": "replace-me",
+      "url": "https://api.openai.com/v1",
+      "thrashLimit": 0,
+      "parallelLimit": 0,
+      "models": [
+        { "id": "gpt-4o-mini", "contextLimit": 128000, "tokenInputCost": 0.15, "tokenOutputCost": 0.60 }
+      ],
+      "enabled": true
+    },
+    {
+      "kind": "gemini",
+      "name": "gemini",
+      "apiKey": "replace-me",
+      "url": "https://generativelanguage.googleapis.com/v1beta",
+      "thrashLimit": 0,
+      "parallelLimit": 0,
+      "models": [
+        { "id": "gemini-2.5-flash", "contextLimit": 1048576 }
+      ],
+      "enabled": true
+    },
+    {
+      "kind": "lmstudio",
+      "name": "local",
+      "apiKey": "",
+      "url": "http://host.docker.internal:1234/v1",
+      "thrashLimit": 2,
+      "parallelLimit": 2,
+      "models": [
+        { "id": "local-model", "contextLimit": 32768, "tokenInputCost": 0.0, "tokenOutputCost": 0.0 }
+      ],
+      "enabled": true
+    },
+    {
+      "kind": "ollama",
+      "name": "local",
+      "apiKey": "",
+      "url": "http://host.docker.internal:11434",
+      "thrashLimit": 2,
+      "parallelLimit": 2,
+      "models": [
+        { "id": "llama3.1", "contextLimit": 8192 }
+      ],
+      "enabled": true
+    }
+  ],
+  "routing": {
+    "version": "v1",
+    "scoring": {
+      "tokenCountThresholds": { "simple": 400, "complex": 1600 },
+      "codeKeywords": ["code", "function", "type", "interface", "api", "compile", "error", "bug"],
+      "reasoningKeywords": ["reason", "explain", "analyze", "why", "tradeoff"],
+      "simpleKeywords": ["simple", "quick", "brief", "summarize"],
+      "technicalKeywords": ["go", "http", "json", "grpc", "sql", "docker", "kubernetes"],
+      "creativeKeywords": ["write", "story", "poem", "brainstorm", "design"],
+      "imperativeVerbs": ["build", "create", "implement", "fix", "add"],
+      "constraintIndicators": ["must", "should", "only", "exactly", "without"],
+      "outputFormatKeywords": ["json", "yaml", "table", "code", "markdown"],
+      "referenceKeywords": ["this", "that", "above", "below", "file"],
+      "negationKeywords": ["not", "never", "without", "except"],
+      "domainSpecificKeywords": ["router", "model", "provider", "streaming", "fallback"],
+      "agenticTaskKeywords": ["plan", "iterate", "refactor", "deploy", "test"],
+      "dimensionWeights": {
+        "tokenCount": 0.30,
+        "codePresence": 0.35,
+        "reasoningMarkers": 0.30,
+        "technicalTerms": 0.20,
+        "creativeMarkers": 0.12,
+        "simpleIndicators": 0.18,
+        "multiStepPatterns": 0.12,
+        "questionComplexity": 0.10,
+        "imperativeVerbs": 0.10,
+        "constraintCount": 0.15,
+        "outputFormat": 0.12,
+        "referenceComplexity": 0.08,
+        "negationComplexity": 0.08,
+        "domainSpecificity": 0.12,
+        "agenticTask": 0.20
+      },
+      "tierBoundaries": {
+        "simpleMedium": -0.10,
+        "mediumComplex": 0.18,
+        "complexReasoning": 0.42
+      },
+      "confidenceSteepness": 8,
+      "confidenceThreshold": 0.65
+    },
+    "overrides": {
+      "maxTokensForceComplex": 8000,
+      "structuredOutputMinTier": "MEDIUM",
+      "ambiguousDefaultTier": "MEDIUM"
+    },
+    "failures": {
+      "default": {
+        "retry": 0,
+        "tierNext": true,
+        "tierSwitch": "none"
+      },
+      "timeout": {
+        "retry": 1,
+        "tierNext": true,
+        "tierSwitch": "up"
+      },
+      "rateLimit": {
+        "retry": 1,
+        "tierNext": true,
+        "tierSwitch": "up"
+      },
+      "unavailable": {
+        "retry": 0,
+        "tierNext": true,
+        "tierSwitch": "down"
+      },
+      "serverError": {
+        "retry": 0,
+        "tierNext": true,
+        "tierSwitch": "none"
+      }
+    },
+    "tiers": {
+      "SIMPLE": {
+        "models": ["openai:openai:gpt-4o-mini", "gemini:gemini:gemini-2.5-flash"]
+      },
+      "MEDIUM": {
+        "models": ["openai:openai:gpt-4o-mini", "gemini:gemini:gemini-2.5-flash"]
+      },
+      "COMPLEX": {
+        "models": ["openai:openai:gpt-4o-mini", "gemini:gemini:gemini-2.5-flash", "ollama:local:llama3.1"]
+      },
+      "REASONING": {
+        "models": ["gemini:gemini:gemini-2.5-flash", "openai:openai:gpt-4o-mini"]
+      }
+    }
+  }
+}
