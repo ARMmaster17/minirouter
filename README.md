@@ -1,98 +1,58 @@
-# minirouter
+# Minirouter
 
-Lightweight, local-first AI model router.
+Minirouter is a lightweight, local-first AI model router designed to simplify how you interact with multiple LLM providers. It acts as a smart gateway, routing your requests to the most appropriate model based on cost, context limits, and custom routing rules, while providing a unified OpenAI-compatible API.
 
-## What is implemented
+Whether you are using cloud giants like OpenAI and Gemini or running local models via Ollama and LM Studio, Minirouter gives you a single endpoint to manage them all.
 
-- Go server scaffold with hexagonal boundaries in `internal/`
-- Duplicated freerouter-style rules engine for model classification
-- JSON config loading with environment overrides
-- Mock provider and provider registry for local testing and deterministic responses
-- Failure-aware fallback routing with configurable retry/failover policies
-- Concrete provider adapters for OpenAI, Gemini, LM Studio, and Ollama
-- OpenAI-compatible `v1/models` and `v1/chat/completions`
-- Streaming support using SSE
-- Live HTMX dashboard at `/` with SSE refresh
-- Request logging with in-memory adapter (hexagonal port, DB-ready)
-- Optional inbound API key enforcement for OpenAI-compatible endpoints
-- Dockerfile, Compose file, and sample config
-- Unit tests for routing, config, app, and HTTP layers
+## Getting Started
 
-## Run locally
+### Raw Binary
+If you have Go installed, you can run Minirouter directly from the source:
 
 ```bash
-go test ./...
+# Run immediately
 go run ./cmd/minirouter
+
+# Or build the binary
+go build -o minirouter ./cmd/minirouter
+./minirouter
 ```
 
-Set `MINIROUTER_CONFIG` to point at a JSON file if you want to load custom providers.
+**Custom Configuration:** By default, Minirouter boots with a built-in mock provider for easy testing. To use your own providers, create a `config.json` file and point the server to it using an environment variable:
 
-The root URL (`/`) serves a small dashboard by default. It shows recent routed requests and aggregate routing stats and auto-refreshes via SSE.
+```bash
+export MINIROUTER_CONFIG=/path/to/your/config.json
+./minirouter
+```
 
-If no providers are configured, the binary boots with the built-in mock provider so the service is usable locally without upstream credentials.
-
-## Docker
+### Docker Compose
+For a quick, containerized deployment, use Docker Compose:
 
 ```bash
 docker compose up --build
 ```
 
-## Configuration
+## Configuration & Tuning
 
-Start from `config.example.json` and add provider entries for:
+Minirouter is configured via a JSON file (see `config.example.json` for a template). 
 
-- Google Gemini
-- OpenAI
-- LM Studio
-- Ollama
+### Key Tuning Options
 
-Concrete provider adapters live in `internal/adapters/providers`.
+- **Provider Overrides**: You can manually specify `contextLimit`, `tokenInputCost`, and `tokenOutputCost` for any model. If provided in the config, these override the metadata returned by the upstream provider.
+- **Thrash Limit**: For local runtimes (like Ollama or LM Studio), set a `thrashLimit` greater than zero. This applies a recency preference to the last N models used, reducing the performance hit of frequently loading and unloading models from VRAM.
+- **Routing Tiers**: Organise your models into ordered tiers. Minirouter will attempt to resolve requests through these tiers sequentially, ensuring high-quality models are tried first, with cheaper or smaller models as fallbacks.
+- **Failure Policies**: Configure how the router handles errors. You can define specific retry policies or explicit fallback model IDs based on the type of failure encountered.
+- **API Security**: Enable `server.incomingAPIKey` in your config to protect your endpoints. When set, requests must include an `Authorization: Bearer <key>` header.
 
-- `openai.go`
-- `gemini.go`
-- `lmstudio.go`
-- `ollama.go`
+### Monitoring
+Minirouter includes a built-in **HTMX Dashboard** accessible at the root URL (`/`). The dashboard provides real-time visibility into routed requests and aggregate statistics via SSE.
 
-To add a new provider, add a new `.go` file in `internal/adapters/providers` and implement the `app.Provider` interface, then register it in `factory.go`.
+## Support & Contributing
 
-The router uses a synthetic `auto` model that is resolved by the rules engine before dispatch.
+We welcome community feedback! If you encounter a bug or have an idea for a new feature, please open an issue on GitHub:
 
-Each provider can include an optional `thrashLimit` (for example local runtimes like LM Studio/Ollama). When set to a value greater than zero, routing applies a recency preference to the last N distinct models used on that provider, reducing model load/unload thrash when candidates are close.
+👉 [GitHub Issues](https://github.com/ARMmaster17/minirouter/issues)
 
-On server boot, enabled providers are queried for model metadata (context limits and any pricing metadata they expose). Failures are logged as warnings and startup continues.
+## License
 
-Each provider model entry can include optional overrides:
-
-- `contextLimit`
-- `tokenInputCost` (cost per 1M input tokens)
-- `tokenOutputCost` (cost per 1M output tokens)
-
-Override precedence is config-first: if an override is present in config, it replaces upstream metadata for that field.
-
-If `tokenInputCost`/`tokenOutputCost` are missing in both config and upstream metadata, the model is treated as free.
-
-Routing now also applies:
-
-- Context-limit eligibility: models with known context limits below request size are skipped.
-- Cost preference: lower-cost models are weighted higher when candidates are otherwise close.
-
-Routing tiers now accept ordered model arrays (`routing.tiers.<TIER>.models`), and selection falls through in that order.
-
-Failure routing lives under `routing.failures` and can retry or fall back to explicit model IDs depending on the error class.
-
-Server-level options:
-
-- `server.frontendEnabled` (default `true`): serves the HTMX dashboard at `/` and UI fragment/SSE endpoints.
-- `server.incomingAPIKey` (default empty): when set, requests to `v1/models` and `v1/chat/completions` must include `Authorization: Bearer <key>`.
-
-Environment overrides:
-
-- `MINIROUTER_FRONTEND_ENABLED`
-- `MINIROUTER_INCOMING_API_KEY`
-
-Request logging uses a hexagonal `RequestLogStore` port (`internal/app/request_log.go`) with an in-memory implementation in `internal/adapters/logs/memory.go`. This keeps the app layer storage-agnostic and ready for a future PostgreSQL adapter.
-
-## Next steps
-
-- Implement OpenAI passthrough routes beyond chat completions
-- Expand failure-type policies and request-level routing controls
+Minirouter is licensed under the **GNU Affero General Public License v3 (AGPLv3)**.

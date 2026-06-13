@@ -164,6 +164,13 @@ func (r *Router) ResolveModel(requestModel, prompt string, estimatedInputTokens 
 	// If the requestModel is specified and not "auto" or auto-*, find it in the catalog
 	if requestModel != "" && (requestModel != "auto" && !strings.HasPrefix(requestModel, "auto-")) {
 		if metadata := r.modelMetadataByID(); metadata[requestModel].ID != "" {
+			r.debugRouting("explicit_model", map[string]any{
+				"requestModel":          requestModel,
+				"resolvedModel":         requestModel,
+				"estimatedInputTokens":  estimatedInputTokens,
+				"result":                domain.ScoringResult{Tier: domain.TierReasoning, Confidence: 1},
+				"decision":              "request model bypassed auto routing",
+			})
 			return requestModel, domain.ScoringResult{Tier: domain.TierReasoning, Confidence: 1}, nil
 		}
 		return "", domain.ScoringResult{}, errors.New("requested model not found")
@@ -188,12 +195,33 @@ func (r *Router) ResolveModel(requestModel, prompt string, estimatedInputTokens 
 			return "", domain.ScoringResult{}, fmt.Errorf("invalid auto tier suffix: %s", suffix)
 		}
 		result := domain.ScoringResult{Tier: tier, Confidence: 1}
-		return r.selectTierModel(result, estimatedInputTokens), result, nil
+		selected := r.selectTierModel(result, estimatedInputTokens)
+		r.debugRouting("tier_alias", map[string]any{
+			"requestModel":         requestModel,
+			"selectedTier":         tier,
+			"estimatedInputTokens": estimatedInputTokens,
+			"resolvedModel":        selected,
+			"result":               result,
+		})
+		return selected, result, nil
 	}
-	result := domain.ClassifyByRules(prompt, nil, estimatedInputTokens, r.Config.Routing.Scoring)
+	explanation := domain.ExplainClassification(prompt, nil, estimatedInputTokens, r.Config.Routing.Scoring)
+	result := explanation.Result
+	r.debugRouting("classification", map[string]any{
+		"requestModel":         requestModel,
+		"promptPreview":        promptPreview(prompt),
+		"classification":       explanation,
+		"ambiguousDefaultTier": r.Config.Routing.Overrides.AmbiguousDefaultTier,
+	})
 	selected := r.selectTierModel(result, estimatedInputTokens)
 	if selected == "" {
 		selected = r.fallbackModel()
+		r.debugRouting("fallback_model", map[string]any{
+			"reason":               "no eligible tier model selected",
+			"estimatedInputTokens": estimatedInputTokens,
+			"resolvedModel":        selected,
+			"result":               result,
+		})
 	}
 	if selected == "" {
 		return "", result, errors.New("no routable model found")
@@ -291,6 +319,18 @@ func (r *Router) chatWithTierFallbacks(ctx context.Context, req ChatRequest, tie
 	if req.Model != "" {
 		candidates = prioritizeModel(candidates, req.Model)
 	}
+	orderedCandidates, evaluations, skipped := r.rankModelsForTierWithDetails(tier, estimatedInputTokens)
+	if req.Model != "" {
+		orderedCandidates = prioritizeModel(orderedCandidates, req.Model)
+	}
+	r.debugRouting("tier_candidates", map[string]any{
+		"tier":                 tier,
+		"estimatedInputTokens": estimatedInputTokens,
+		"requestedModel":       req.Model,
+		"orderedCandidates":    orderedCandidates,
+		"evaluations":          evaluations,
+		"skipped":              skipped,
+	})
 
 	lastPolicy := r.failurePolicyForError(nil)
 	var lastErr error
@@ -302,13 +342,30 @@ func (r *Router) chatWithTierFallbacks(ctx context.Context, req ChatRequest, tie
 		attemptedAny = true
 		attemptReq := req
 		attemptReq.Model = candidate
+		r.debugRouting("chat_attempt", map[string]any{
+			"tier":      tier,
+			"model":     candidate,
+			"attemptReq": map[string]any{"stream": attemptReq.Stream, "messages": len(attemptReq.Messages)},
+		})
 		response, policy, err := r.chatModelWithPolicy(ctx, attemptReq)
 		if err == nil {
+			r.debugRouting("chat_attempt_result", map[string]any{
+				"tier":   tier,
+				"model":  candidate,
+				"result": "success",
+			})
 			return response, nil
 		}
 		failedModels[candidate] = struct{}{}
 		lastErr = err
 		lastPolicy = policy
+		r.debugRouting("chat_attempt_result", map[string]any{
+			"tier":         tier,
+			"model":        candidate,
+			"result":       "failure",
+			"error":        err.Error(),
+			"failurePolicy": policy,
+		})
 		if !failurePolicyTierNext(policy) {
 			break
 		}
@@ -327,6 +384,12 @@ func (r *Router) chatWithTierFallbacks(ctx context.Context, req ChatRequest, tie
 		if !ok {
 			return ChatResponse{}, lastErr
 		}
+		r.debugRouting("tier_fallback", map[string]any{
+			"fromTier":     tier,
+			"toTier":       nextTier,
+			"error":        lastErr.Error(),
+			"failurePolicy": lastPolicy,
+		})
 		nextReq := req
 		nextReq.Model = ""
 		return r.chatWithTierFallbacks(ctx, nextReq, nextTier, estimatedInputTokens, visited, failedModels)
@@ -379,28 +442,8 @@ func (r *Router) chatModelWithPolicy(ctx context.Context, req ChatRequest) (Chat
 }
 
 func (r *Router) rankModelsForTier(tier domain.Tier, estimatedInputTokens int) []string {
-	tierConfig, ok := r.Config.Routing.Tiers[tier]
-	if !ok {
-		return nil
-	}
-	modelMetadata := r.modelMetadataByID()
-	candidates := make([]string, 0, len(tierConfig.Models))
-	for _, candidate := range tierConfig.Models {
-		if candidate == "auto" {
-			continue
-		}
-		if _, ok := modelMetadata[candidate]; !ok {
-			continue
-		}
-		if !withinContextLimit(modelMetadata[candidate], estimatedInputTokens) {
-			continue
-		}
-		candidates = append(candidates, candidate)
-	}
-	if len(candidates) == 0 {
-		return nil
-	}
-	return r.rankTierCandidates(candidates, modelMetadata, estimatedInputTokens)
+	ordered, _, _ := r.rankModelsForTierWithDetails(tier, estimatedInputTokens)
+	return ordered
 }
 
 func (r *Router) findTierForModel(modelID string, estimatedInputTokens int) domain.Tier {
@@ -492,29 +535,36 @@ func (r *Router) selectTierModel(result domain.ScoringResult, estimatedInputToke
 	if result.Ambiguous {
 		tier = r.Config.Routing.Overrides.AmbiguousDefaultTier
 	}
-	tierConfig, ok := r.Config.Routing.Tiers[tier]
-	if !ok {
+	ordered, evaluations, skipped := r.rankModelsForTierWithDetails(tier, estimatedInputTokens)
+	if len(ordered) == 0 {
+		r.debugRouting("tier_selection", map[string]any{
+			"tier":                 tier,
+			"estimatedInputTokens": estimatedInputTokens,
+			"selectedModel":        "",
+			"result":               result,
+			"skipped":              skipped,
+		})
 		return ""
 	}
-	modelMetadata := r.modelMetadataByID()
-	candidates := make([]string, 0, len(tierConfig.Models))
-	for _, candidate := range tierConfig.Models {
-		if candidate == "auto" {
-			continue
-		}
-		if _, ok := modelMetadata[candidate]; !ok {
-			continue
-		}
-		if !withinContextLimit(modelMetadata[candidate], estimatedInputTokens) {
-			continue
-		}
-		candidates = append(candidates, candidate)
+	selected := ordered[0]
+	r.debugRouting("tier_selection", map[string]any{
+		"tier":                 tier,
+		"estimatedInputTokens": estimatedInputTokens,
+		"selectedModel":        selected,
+		"result":               result,
+		"orderedCandidates":    ordered,
+		"evaluations":          evaluations,
+		"skipped":              skipped,
+	})
+	return selected
+}
+
+func promptPreview(prompt string) string {
+	prompt = strings.TrimSpace(prompt)
+	if len(prompt) <= 120 {
+		return prompt
 	}
-	if len(candidates) == 0 {
-		return ""
-	}
-	ordered := r.rankTierCandidates(candidates, modelMetadata, estimatedInputTokens)
-	return ordered[0]
+	return prompt[:117] + "..."
 }
 
 func (r *Router) modelMetadataByID() map[string]Model {

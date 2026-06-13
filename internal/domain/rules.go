@@ -12,6 +12,21 @@ type dimensionScore struct {
 	signal string
 }
 
+type DimensionContribution struct {
+	Name          string  `json:"name"`
+	Score         float64 `json:"score"`
+	Weight        float64 `json:"weight"`
+	WeightedScore float64 `json:"weightedScore"`
+	Signal        string  `json:"signal,omitempty"`
+}
+
+type ScoringExplanation struct {
+	EstimatedTokens        int                     `json:"estimatedTokens"`
+	Result                 ScoringResult           `json:"result"`
+	Dimensions             []DimensionContribution `json:"dimensions"`
+	ReasoningKeywordMatches []string               `json:"reasoningKeywordMatches,omitempty"`
+}
+
 func scoreTokenCount(estimatedTokens int, thresholds TokenCountThresholds) dimensionScore {
 	if estimatedTokens < thresholds.Simple {
 		return dimensionScore{name: "tokenCount", score: -1.0, signal: "short"}
@@ -84,6 +99,32 @@ func scoreAgenticTask(text string, keywords []string) (dimensionScore, float64) 
 }
 
 func ClassifyByRules(prompt string, systemPrompt *string, estimatedTokens int, config ScoringConfig) ScoringResult {
+	result, _, _ := classifyByRulesDetailed(prompt, systemPrompt, estimatedTokens, config)
+	return result
+}
+
+func ExplainClassification(prompt string, systemPrompt *string, estimatedTokens int, config ScoringConfig) ScoringExplanation {
+	result, dimensions, reasoningMatches := classifyByRulesDetailed(prompt, systemPrompt, estimatedTokens, config)
+	contributions := make([]DimensionContribution, 0, len(dimensions))
+	for _, dimension := range dimensions {
+		weight := config.DimensionWeights[dimension.name]
+		contributions = append(contributions, DimensionContribution{
+			Name:          dimension.name,
+			Score:         dimension.score,
+			Weight:        weight,
+			WeightedScore: dimension.score * weight,
+			Signal:        dimension.signal,
+		})
+	}
+	return ScoringExplanation{
+		EstimatedTokens:        estimatedTokens,
+		Result:                 result,
+		Dimensions:             contributions,
+		ReasoningKeywordMatches: reasoningMatches,
+	}
+}
+
+func classifyByRulesDetailed(prompt string, systemPrompt *string, estimatedTokens int, config ScoringConfig) (ScoringResult, []dimensionScore, []string) {
 	text := strings.ToLower(strings.TrimSpace(func() string {
 		if systemPrompt == nil {
 			return prompt
@@ -133,7 +174,7 @@ func ClassifyByRules(prompt string, systemPrompt *string, estimatedTokens int, c
 		if confidence < 0.85 {
 			confidence = 0.85
 		}
-		return ScoringResult{Score: weightedScore, Tier: TierReasoning, Confidence: confidence, Signals: signals, AgenticScore: agenticScore}
+		return ScoringResult{Score: weightedScore, Tier: TierReasoning, Confidence: confidence, Signals: signals, AgenticScore: agenticScore}, dimensions, reasoningMatches
 	}
 
 	boundaries := config.TierBoundaries
@@ -157,10 +198,10 @@ func ClassifyByRules(prompt string, systemPrompt *string, estimatedTokens int, c
 
 	confidence := calibrateConfidence(distanceFromBoundary, config.ConfidenceSteepness)
 	if confidence < config.ConfidenceThreshold {
-		return ScoringResult{Score: weightedScore, Confidence: confidence, Signals: signals, AgenticScore: agenticScore, Ambiguous: true}
+		return ScoringResult{Score: weightedScore, Confidence: confidence, Signals: signals, AgenticScore: agenticScore, Ambiguous: true}, dimensions, reasoningMatches
 	}
 
-	return ScoringResult{Score: weightedScore, Tier: tier, Confidence: confidence, Signals: signals, AgenticScore: agenticScore}
+	return ScoringResult{Score: weightedScore, Tier: tier, Confidence: confidence, Signals: signals, AgenticScore: agenticScore}, dimensions, reasoningMatches
 }
 
 func calibrateConfidence(distance, steepness float64) float64 {

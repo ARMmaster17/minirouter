@@ -104,6 +104,7 @@ func Default() Config {
 		Server: ServerConfig{Addr: ":8080", FrontendEnabled: true},
 		Routing: domain.RoutingConfig{
 			Version: "v1",
+			Debug:   false,
 			Scoring: scoring,
 			Tiers: map[domain.Tier]domain.TierConfig{
 				domain.TierSimple:    {Models: []string{"openai:default"}},
@@ -160,6 +161,11 @@ func applyEnvOverrides(cfg *Config) {
 	if value := os.Getenv("MINIROUTER_ROUTING_CONFIDENCE_THRESHOLD"); value != "" {
 		if parsed, err := strconv.ParseFloat(value, 64); err == nil {
 			cfg.Routing.Scoring.ConfidenceThreshold = parsed
+		}
+	}
+	if value := os.Getenv("MINIROUTER_ROUTING_DEBUG"); value != "" {
+		if parsed, err := strconv.ParseBool(value); err == nil {
+			cfg.Routing.Debug = parsed
 		}
 	}
 	for index := range cfg.Providers {

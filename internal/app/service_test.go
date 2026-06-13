@@ -1,7 +1,11 @@
 package app
 
 import (
+	"bytes"
 	"context"
+	"io"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -229,6 +233,91 @@ func TestChatBalancesActiveRequestCounter(t *testing.T) {
 	if counter.Count("mock:mock") != 0 {
 		t.Fatalf("expected active request counter to be balanced after chat, got %d", counter.Count("mock:mock"))
 	}
+}
+
+func TestRoutingDebugPrintsClassificationRankingAndAttempts(t *testing.T) {
+	cfg := config.Default()
+	cfg.Routing.Debug = true
+	cfg.Providers = []config.ProviderConfig{{
+		Kind:    "mock",
+		Name:    "mock",
+		Enabled: true,
+		Models:  []config.ModelConfig{{ID: "model-a"}, {ID: "model-b"}},
+	}}
+	cfg.Routing.Tiers[domain.TierSimple] = domain.TierConfig{Models: []string{"mock:mock:model-a", "mock:mock:model-b"}}
+
+	provider := NewMockProviderWithFailures(
+		"mock:mock",
+		[]string{"model-a", "model-b"},
+		map[string]string{"mock:mock:model-b": "ok"},
+		map[string]string{"mock:mock:model-a": "timeout"},
+	)
+	router := NewRouter(cfg, NewStaticCatalog(cfg), provider)
+
+	output := captureStdout(t, func() {
+		_, _, err := router.Chat(context.Background(), ChatRequest{Model: "auto", Prompt: "simple request"})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	checks := []string{
+		"[routing-debug] classification",
+		"[routing-debug] tier_selection",
+		"[routing-debug] tier_candidates",
+		"[routing-debug] chat_attempt_result",
+		"\"rule\": \"baseOrder\"",
+		"\"model\": \"mock:mock:model-a\"",
+		"\"result\": \"failure\"",
+		"\"model\": \"mock:mock:model-b\"",
+		"\"result\": \"success\"",
+	}
+	for _, check := range checks {
+		if !strings.Contains(output, check) {
+			t.Fatalf("expected debug output to contain %q, got:\n%s", check, output)
+		}
+	}
+}
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	original := os.Stdout
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = writer
+	defer func() {
+		os.Stdout = original
+	}()
+
+	outputCh := make(chan []byte, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		var buffer bytes.Buffer
+		_, copyErr := io.Copy(&buffer, reader)
+		if copyErr != nil {
+			errCh <- copyErr
+			return
+		}
+		outputCh <- buffer.Bytes()
+	}()
+
+	fn()
+
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case copyErr := <-errCh:
+		t.Fatal(copyErr)
+	case data := <-outputCh:
+		return string(data)
+	}
+	return ""
 }
 
 type stubActiveRequestCounter struct {

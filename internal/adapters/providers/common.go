@@ -91,6 +91,14 @@ func selectConfiguredModels(providerID string, models []app.Model, configured []
 		selected = append(selected, upstream)
 	}
 	if len(missing) > 0 {
+		// DEBUG: Pretty print the list of available models for easier debugging of config issues
+		availableIDs := make([]string, 0, len(models))
+		for _, model := range models {
+			availableIDs = append(availableIDs, model.ID)
+		}
+		sort.Strings(availableIDs)
+		fmt.Printf("DEBUG: Available models for provider %s: %s\n", providerID, strings.Join(availableIDs, ", "))
+
 		return nil, &ConfiguredModelsMissingError{ProviderID: providerID, Missing: missing}
 	}
 	return selected, nil

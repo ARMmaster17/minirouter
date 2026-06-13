@@ -56,6 +56,7 @@
   ],
   "routing": {
     "version": "v1",
+    "debug": false,
     "scoring": {
       "tokenCountThresholds": { "simple": 400, "complex": 1600 },
       "codeKeywords": ["code", "function", "type", "interface", "api", "compile", "error", "bug"],

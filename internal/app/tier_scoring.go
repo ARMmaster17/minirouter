@@ -13,6 +13,18 @@ type TierModelScoringContext struct {
 	ConfigModelOrder     map[string]int
 }
 
+type TierCandidateRuleScore struct {
+	Rule  string  `json:"rule"`
+	Score float64 `json:"score"`
+}
+
+type TierCandidateEvaluation struct {
+	Model         string                   `json:"model"`
+	OriginalIndex int                      `json:"originalIndex"`
+	TotalScore    float64                  `json:"totalScore"`
+	RuleScores    []TierCandidateRuleScore `json:"ruleScores"`
+}
+
 type TierModelScoringRule interface {
 	Name() string
 	Score(candidateID string, candidate Model, index int, ctx TierModelScoringContext) float64
@@ -97,10 +109,23 @@ func defaultTierScoringRules() []TierModelScoringRule {
 }
 
 func (r *Router) rankTierCandidates(candidates []string, modelMetadata map[string]Model, estimatedInputTokens int) []string {
+	ordered, _ := r.evaluateTierCandidates(candidates, modelMetadata, estimatedInputTokens)
+	return ordered
+}
+
+func (r *Router) evaluateTierCandidates(candidates []string, modelMetadata map[string]Model, estimatedInputTokens int) ([]string, []TierCandidateEvaluation) {
 	ordered := make([]string, len(candidates))
 	copy(ordered, candidates)
 	if len(ordered) <= 1 {
-		return ordered
+		evaluations := make([]TierCandidateEvaluation, 0, len(ordered))
+		for idx, candidateID := range ordered {
+			evaluations = append(evaluations, TierCandidateEvaluation{
+				Model:         candidateID,
+				OriginalIndex: idx,
+				TotalScore:    0,
+			})
+		}
+		return ordered, evaluations
 	}
 	ctx := r.buildTierScoringContext(ordered, estimatedInputTokens)
 	rules := r.TierScoringRules
@@ -112,15 +137,19 @@ func (r *Router) rankTierCandidates(candidates []string, modelMetadata map[strin
 		model string
 		index int
 		score float64
+		rules []TierCandidateRuleScore
 	}
 	scored := make([]candidateScore, 0, len(ordered))
 	for idx, candidateID := range ordered {
 		candidate := modelMetadata[candidateID]
 		score := 0.0
+		ruleScores := make([]TierCandidateRuleScore, 0, len(rules))
 		for _, rule := range rules {
-			score += rule.Score(candidateID, candidate, idx, ctx)
+			ruleScore := rule.Score(candidateID, candidate, idx, ctx)
+			score += ruleScore
+			ruleScores = append(ruleScores, TierCandidateRuleScore{Rule: rule.Name(), Score: ruleScore})
 		}
-		scored = append(scored, candidateScore{model: candidateID, index: idx, score: score})
+		scored = append(scored, candidateScore{model: candidateID, index: idx, score: score, rules: ruleScores})
 	}
 
 	sort.SliceStable(scored, func(i, j int) bool {
@@ -130,10 +159,17 @@ func (r *Router) rankTierCandidates(candidates []string, modelMetadata map[strin
 		return scored[i].score > scored[j].score
 	})
 	out := make([]string, 0, len(scored))
+	evaluations := make([]TierCandidateEvaluation, 0, len(scored))
 	for _, item := range scored {
 		out = append(out, item.model)
+		evaluations = append(evaluations, TierCandidateEvaluation{
+			Model:         item.model,
+			OriginalIndex: item.index,
+			TotalScore:    item.score,
+			RuleScores:    item.rules,
+		})
 	}
-	return out
+	return out, evaluations
 }
 
 func (r *Router) buildTierScoringContext(candidates []string, estimatedInputTokens int) TierModelScoringContext {
