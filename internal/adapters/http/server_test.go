@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"html"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ARMmaster17/minirouter/internal/app"
 	"github.com/ARMmaster17/minirouter/internal/config"
@@ -136,6 +138,15 @@ func TestFrontendEnabledServesRootAndFragments(t *testing.T) {
 	cfg.Routing.Tiers[domain.TierSimple] = domain.TierConfig{Models: []string{"mock:mock:mock-chat"}}
 	mock := app.NewMockProvider("mock:mock", []string{"mock-chat"}, map[string]string{"mock:mock:mock-chat": "mock reply"})
 	logs := &stubRequestLogStore{}
+	logs.entries = []domain.RequestLogEntry{{
+		CreatedAt:     time.Now(),
+		ResolvedModel: "openai:openai:gpt-4o-mini",
+		Tier:          domain.TierSimple,
+		Status:        domain.RequestStatusSuccess,
+		TokenSource:   domain.TokenSourceProvider,
+		RawRequest:    `{"model":"auto","prompt":"hello"}`,
+		RawResponse:   `{"id":"chatcmpl-1","object":"chat.completion"}`,
+	}}
 	counter := &stubActiveRequestCounter{counts: map[string]int{"openai:openai": 2}}
 	server := New(app.NewRouter(cfg, app.NewStaticCatalog(cfg), mock).WithActiveRequestCounter(counter), logs)
 
@@ -161,6 +172,15 @@ func TestFrontendEnabledServesRootAndFragments(t *testing.T) {
 	server.Handler().ServeHTTP(requestsRec, requestsReq)
 	if requestsRec.Code != http.StatusOK {
 		t.Fatalf("expected 200 for requests fragment, got %d", requestsRec.Code)
+	}
+	if !strings.Contains(requestsRec.Body.String(), "Toggle raw payload") {
+		t.Fatalf("expected requests fragment to include payload expander")
+	}
+	if !strings.Contains(requestsRec.Body.String(), html.EscapeString(`{"model":"auto","prompt":"hello"}`)) {
+		t.Fatalf("expected requests fragment to include raw request payload")
+	}
+	if !strings.Contains(requestsRec.Body.String(), html.EscapeString(`{"id":"chatcmpl-1","object":"chat.completion"}`)) {
+		t.Fatalf("expected requests fragment to include raw response payload")
 	}
 
 	activeReq := httptest.NewRequest(http.MethodGet, "/ui/fragments/active-requests", nil)
@@ -348,13 +368,15 @@ func (p *streamingMockProvider) ChatCompletionsStream(_ context.Context, _ app.C
 	return app.ChatStreamResponse{Body: io.NopCloser(strings.NewReader(body)), ContentType: "text/event-stream"}, nil
 }
 
-type stubRequestLogStore struct{}
+type stubRequestLogStore struct {
+	entries []domain.RequestLogEntry
+}
 
 func (s *stubRequestLogStore) Append(_ context.Context, _ domain.RequestLogEntry) error {
 	return nil
 }
 func (s *stubRequestLogStore) Recent(_ int) []domain.RequestLogEntry {
-	return []domain.RequestLogEntry{}
+	return s.entries
 }
 func (s *stubRequestLogStore) Stats() domain.RequestAggregateStats {
 	return domain.RequestAggregateStats{}

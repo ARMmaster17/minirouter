@@ -2,6 +2,7 @@ package httpadapter
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -83,6 +85,47 @@ var pageTemplate = template.Must(template.New("dashboard").Parse(`<!doctype html
 		}
 		.panel-body {
 			padding: 0 1rem 1rem;
+		}
+		.request-row details {
+			display: inline-block;
+		}
+		.request-row summary {
+			cursor: pointer;
+			list-style: none;
+			font-weight: 700;
+			color: var(--accent);
+		}
+		.request-row summary::-webkit-details-marker {
+			display: none;
+		}
+		.request-row summary::before {
+			content: ">";
+			display: inline-block;
+			min-width: 1rem;
+		}
+		.request-row details[open] summary::before {
+			content: "v";
+		}
+		.request-payloads {
+			margin-top: 0.55rem;
+			display: grid;
+			gap: 0.75rem;
+		}
+		.request-payloads h4 {
+			margin: 0 0 0.3rem;
+			font-size: 0.78rem;
+			text-transform: uppercase;
+			letter-spacing: 0.05em;
+			color: var(--muted);
+		}
+		.request-payloads pre {
+			margin: 0;
+			padding: 0.75rem;
+			border-radius: 10px;
+			background: rgba(15, 23, 42, 0.04);
+			white-space: pre-wrap;
+			word-break: break-word;
+			max-width: 560px;
 		}
 		.stats-grid {
 			display: grid;
@@ -271,7 +314,10 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	var req app.ChatRequest
 	if err := json.Unmarshal(bodyBytes, &req); err != nil {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid request body: %w", err))
-		s.logRequest(r, req.Model, "", "", domain.ScoringResult{}, app.ChatResponse{}, http.StatusBadRequest, len(bodyBytes), 0, startedAt, err)
+		errorResponse := invalidRequestErrorBytes(fmt.Errorf("invalid request body: %w", err))
+		s.debugPayload("request", bodyBytes)
+		s.debugPayload("response", errorResponse)
+		s.logRequest(r, req.Model, "", "", domain.ScoringResult{}, app.ChatResponse{}, http.StatusBadRequest, len(bodyBytes), len(errorResponse), bodyBytes, errorResponse, startedAt, err)
 		return
 	}
 	if shouldStreamResponse(req.Stream, r.Header.Get("Accept")) {
@@ -286,11 +332,19 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	response, result, err := s.router.Chat(r.Context(), req)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
-		s.logRequest(r, requestedModel, "", extractRequestText(req), result, app.ChatResponse{}, http.StatusBadRequest, len(bodyBytes), 0, startedAt, err)
+		errorResponse := invalidRequestErrorBytes(err)
+		s.debugPayload("request", bodyBytes)
+		s.debugPayload("response", errorResponse)
+		s.logRequest(r, requestedModel, "", extractRequestText(req), result, app.ChatResponse{}, http.StatusBadRequest, len(bodyBytes), len(errorResponse), bodyBytes, errorResponse, startedAt, err)
 		return
 	}
 	written := 0
+	var responseBody []byte
 	if len(response.RawJSON) > 0 {
+		responseBody = append([]byte(nil), response.RawJSON...)
+		if len(responseBody) == 0 || responseBody[len(responseBody)-1] != '\n' {
+			responseBody = append(responseBody, '\n')
+		}
 		written = writeJSONBytes(w, http.StatusOK, response.RawJSON)
 	} else {
 		content := response.Content
@@ -307,9 +361,16 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 				"finish_reason": "stop",
 			}},
 		}
+		encoded, marshalErr := json.Marshal(payload)
+		if marshalErr != nil {
+			encoded = []byte(`{"error":{"message":"failed to encode response","type":"invalid_request_error"}}`)
+		}
+		responseBody = append(encoded, '\n')
 		written = writeJSON(w, http.StatusOK, payload)
 	}
-	s.logRequest(r, requestedModel, response.Model, extractRequestText(req), result, response, http.StatusOK, len(bodyBytes), written, startedAt, nil)
+	s.debugPayload("request", bodyBytes)
+	s.debugPayload("response", responseBody)
+	s.logRequest(r, requestedModel, response.Model, extractRequestText(req), result, response, http.StatusOK, len(bodyBytes), written, bodyBytes, responseBody, startedAt, nil)
 }
 
 func (s *Server) handleChatCompletionsStream(w http.ResponseWriter, r *http.Request, req app.ChatRequest, bodyBytes []byte, startedAt time.Time) {
@@ -320,7 +381,10 @@ func (s *Server) handleChatCompletionsStream(w http.ResponseWriter, r *http.Requ
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, errors.New("streaming unsupported"))
-		s.logRequest(r, req.Model, "", extractRequestText(req), domain.ScoringResult{}, app.ChatResponse{}, http.StatusInternalServerError, len(bodyBytes), 0, startedAt, errors.New("streaming unsupported"))
+		errorResponse := invalidRequestErrorBytes(errors.New("streaming unsupported"))
+		s.debugPayload("request", bodyBytes)
+		s.debugPayload("response", errorResponse)
+		s.logRequest(r, req.Model, "", extractRequestText(req), domain.ScoringResult{}, app.ChatResponse{}, http.StatusInternalServerError, len(bodyBytes), len(errorResponse), bodyBytes, errorResponse, startedAt, errors.New("streaming unsupported"))
 		return
 	}
 
@@ -338,6 +402,7 @@ func (s *Server) handleChatCompletionsStream(w http.ResponseWriter, r *http.Requ
 
 	resultCh := make(chan chatResult, 1)
 	requestedModel := req.Model
+	var responseBuffer bytes.Buffer
 	go func() {
 		response, result, err := s.router.Chat(r.Context(), req)
 		resultCh <- chatResult{response: response, result: result, err: err}
@@ -350,21 +415,31 @@ func (s *Server) handleChatCompletionsStream(w http.ResponseWriter, r *http.Requ
 	for {
 		select {
 		case <-r.Context().Done():
-			s.logRequest(r, requestedModel, "", extractRequestText(req), domain.ScoringResult{}, app.ChatResponse{}, statusClientClosedRequest, len(bodyBytes), written, startedAt, r.Context().Err())
+			s.debugPayload("request", bodyBytes)
+			s.debugPayload("response", responseBuffer.Bytes())
+			s.logRequest(r, requestedModel, "", extractRequestText(req), domain.ScoringResult{}, app.ChatResponse{}, statusClientClosedRequest, len(bodyBytes), written, bodyBytes, responseBuffer.Bytes(), startedAt, r.Context().Err())
 			return
 		case <-ticker.C:
-			n, _ := fmt.Fprint(w, ": ping\n\n")
+			chunk := ": ping\n\n"
+			responseBuffer.WriteString(chunk)
+			n, _ := fmt.Fprint(w, chunk)
 			written += n
 			flusher.Flush()
 		case outcome := <-resultCh:
 			if outcome.err != nil {
 				errPayload := map[string]any{"error": map[string]any{"message": outcome.err.Error(), "type": "invalid_request_error"}}
 				encodedErr, _ := json.Marshal(errPayload)
-				n1, _ := fmt.Fprintf(w, "data: %s\n\n", encodedErr)
-				n2, _ := fmt.Fprint(w, "data: [DONE]\n\n")
+				errChunk := fmt.Sprintf("data: %s\n\n", encodedErr)
+				doneChunk := "data: [DONE]\n\n"
+				responseBuffer.WriteString(errChunk)
+				responseBuffer.WriteString(doneChunk)
+				n1, _ := fmt.Fprint(w, errChunk)
+				n2, _ := fmt.Fprint(w, doneChunk)
 				written += n1 + n2
 				flusher.Flush()
-				s.logRequest(r, requestedModel, "", extractRequestText(req), outcome.result, app.ChatResponse{}, http.StatusBadRequest, len(bodyBytes), written, startedAt, outcome.err)
+				s.debugPayload("request", bodyBytes)
+				s.debugPayload("response", responseBuffer.Bytes())
+				s.logRequest(r, requestedModel, "", extractRequestText(req), outcome.result, app.ChatResponse{}, http.StatusBadRequest, len(bodyBytes), written, bodyBytes, responseBuffer.Bytes(), startedAt, outcome.err)
 				return
 			}
 
@@ -412,14 +487,24 @@ func (s *Server) handleChatCompletionsStream(w http.ResponseWriter, r *http.Requ
 			encodedRole, _ := json.Marshal(roleChunk)
 			encodedContent, _ := json.Marshal(contentChunk)
 			encodedStop, _ := json.Marshal(stopChunk)
-			n1, _ := fmt.Fprintf(w, "data: %s\n\n", encodedRole)
-			n2, _ := fmt.Fprintf(w, "data: %s\n\n", encodedContent)
-			n3, _ := fmt.Fprintf(w, "data: %s\n\n", encodedStop)
-			n4, _ := fmt.Fprint(w, "data: [DONE]\n\n")
+			roleChunkText := fmt.Sprintf("data: %s\n\n", encodedRole)
+			contentChunkText := fmt.Sprintf("data: %s\n\n", encodedContent)
+			stopChunkText := fmt.Sprintf("data: %s\n\n", encodedStop)
+			doneChunk := "data: [DONE]\n\n"
+			responseBuffer.WriteString(roleChunkText)
+			responseBuffer.WriteString(contentChunkText)
+			responseBuffer.WriteString(stopChunkText)
+			responseBuffer.WriteString(doneChunk)
+			n1, _ := fmt.Fprint(w, roleChunkText)
+			n2, _ := fmt.Fprint(w, contentChunkText)
+			n3, _ := fmt.Fprint(w, stopChunkText)
+			n4, _ := fmt.Fprint(w, doneChunk)
 			written += n1 + n2 + n3 + n4
 			flusher.Flush()
 
-			s.logRequest(r, requestedModel, outcome.response.Model, extractRequestText(req), outcome.result, outcome.response, http.StatusOK, len(bodyBytes), written, startedAt, nil)
+			s.debugPayload("request", bodyBytes)
+			s.debugPayload("response", responseBuffer.Bytes())
+			s.logRequest(r, requestedModel, outcome.response.Model, extractRequestText(req), outcome.result, outcome.response, http.StatusOK, len(bodyBytes), written, bodyBytes, responseBuffer.Bytes(), startedAt, nil)
 			return
 		}
 	}
@@ -475,14 +560,18 @@ func (s *Server) tryProxyProviderStream(w http.ResponseWriter, r *http.Request, 
 	}
 
 	written := 0
+	var responseBuffer bytes.Buffer
 	reader := bufio.NewReader(streamResponse.Body)
 	for {
 		line, readErr := reader.ReadBytes('\n')
 		if len(line) > 0 {
+			responseBuffer.Write(line)
 			n, writeErr := w.Write(line)
 			written += n
 			if writeErr != nil {
-				s.logRequest(r, requestedModel, resolvedForLog, extractRequestText(req), result, app.ChatResponse{Model: resolvedForLog}, http.StatusBadGateway, len(bodyBytes), written, startedAt, writeErr)
+				s.debugPayload("request", bodyBytes)
+				s.debugPayload("response", responseBuffer.Bytes())
+				s.logRequest(r, requestedModel, resolvedForLog, extractRequestText(req), result, app.ChatResponse{Model: resolvedForLog}, http.StatusBadGateway, len(bodyBytes), written, bodyBytes, responseBuffer.Bytes(), startedAt, writeErr)
 				return true
 			}
 			flusher.Flush()
@@ -491,10 +580,14 @@ func (s *Server) tryProxyProviderStream(w http.ResponseWriter, r *http.Request, 
 			continue
 		}
 		if errors.Is(readErr, io.EOF) {
-			s.logRequest(r, requestedModel, resolvedForLog, extractRequestText(req), result, app.ChatResponse{Model: resolvedForLog}, http.StatusOK, len(bodyBytes), written, startedAt, nil)
+			s.debugPayload("request", bodyBytes)
+			s.debugPayload("response", responseBuffer.Bytes())
+			s.logRequest(r, requestedModel, resolvedForLog, extractRequestText(req), result, app.ChatResponse{Model: resolvedForLog}, http.StatusOK, len(bodyBytes), written, bodyBytes, responseBuffer.Bytes(), startedAt, nil)
 			return true
 		}
-		s.logRequest(r, requestedModel, resolvedForLog, extractRequestText(req), result, app.ChatResponse{Model: resolvedForLog}, http.StatusBadGateway, len(bodyBytes), written, startedAt, readErr)
+		s.debugPayload("request", bodyBytes)
+		s.debugPayload("response", responseBuffer.Bytes())
+		s.logRequest(r, requestedModel, resolvedForLog, extractRequestText(req), result, app.ChatResponse{Model: resolvedForLog}, http.StatusBadGateway, len(bodyBytes), written, bodyBytes, responseBuffer.Bytes(), startedAt, readErr)
 		return true
 	}
 }
@@ -628,14 +721,22 @@ func (s *Server) handleUIRequests(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("<p>No requests captured yet.</p>"))
 		return
 	}
-	_, _ = w.Write([]byte("<table><thead><tr><th>Time</th><th>Model</th><th>Tier</th><th>Status</th><th>Tokens</th><th>Bytes In/Out</th><th>Latency</th></tr></thead><tbody>"))
+	_, _ = w.Write([]byte("<table><thead><tr><th>Time</th><th>Model</th><th>Tier</th><th>Status</th><th>Tokens</th><th>Bytes In/Out</th><th>Latency</th><th>Raw</th></tr></thead><tbody>"))
 	for _, entry := range entries {
 		statusClass := "status-ok"
 		if entry.Status == domain.RequestStatusError {
 			statusClass = "status-err"
 		}
+		requestPayload := entry.RawRequest
+		if strings.TrimSpace(requestPayload) == "" {
+			requestPayload = "(not captured)"
+		}
+		responsePayload := entry.RawResponse
+		if strings.TrimSpace(responsePayload) == "" {
+			responsePayload = "(not captured)"
+		}
 		_, _ = fmt.Fprintf(w,
-			"<tr><td>%s</td><td>%s</td><td>%s</td><td class=\"%s\">%s</td><td>%d (%s)</td><td>%d / %d</td><td>%d ms</td></tr>",
+			"<tr class=\"request-row\"><td>%s</td><td>%s</td><td>%s</td><td class=\"%s\">%s</td><td>%d (%s)</td><td>%d / %d</td><td>%d ms</td><td><details><summary aria-label=\"Toggle raw payload\"></summary><div class=\"request-payloads\"><div><h4>Request</h4><pre>%s</pre></div><div><h4>Response</h4><pre>%s</pre></div></div></details></td></tr>",
 			entry.CreatedAt.Format(time.RFC3339),
 			template.HTMLEscapeString(entry.ResolvedModel),
 			template.HTMLEscapeString(string(entry.Tier)),
@@ -646,6 +747,8 @@ func (s *Server) handleUIRequests(w http.ResponseWriter, _ *http.Request) {
 			entry.RequestBytes,
 			entry.ResponseBytes,
 			entry.Duration.Milliseconds(),
+			template.HTMLEscapeString(requestPayload),
+			template.HTMLEscapeString(responsePayload),
 		)
 	}
 	_, _ = w.Write([]byte("</tbody></table>"))
@@ -769,7 +872,7 @@ func (s *Server) handleUIStream(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) logRequest(r *http.Request, requestedModel, resolvedModel, requestText string, result domain.ScoringResult, response app.ChatResponse, httpStatus int, requestBytes, responseBytes int, startedAt time.Time, chatErr error) {
+func (s *Server) logRequest(r *http.Request, requestedModel, resolvedModel, requestText string, result domain.ScoringResult, response app.ChatResponse, httpStatus int, requestBytes, responseBytes int, rawRequest, rawResponse []byte, startedAt time.Time, chatErr error) {
 	if s.requestLogs == nil {
 		return
 	}
@@ -800,9 +903,29 @@ func (s *Server) logRequest(r *http.Request, requestedModel, resolvedModel, requ
 		TokenSource:      tokenSource,
 		RequestBytes:     requestBytes,
 		ResponseBytes:    responseBytes,
+		RawRequest:       string(rawRequest),
+		RawResponse:      string(rawResponse),
 		Duration:         time.Since(startedAt),
 	}
 	_ = s.requestLogs.Append(r.Context(), entry)
+}
+
+func (s *Server) debugPayload(event string, payload []byte) {
+	if s.router == nil || !s.router.Config.Routing.PayloadDebug {
+		return
+	}
+	fmt.Fprintf(os.Stdout, "[payload-debug] %s\n%s\n", event, payload)
+}
+
+func invalidRequestErrorBytes(err error) []byte {
+	encoded, marshalErr := json.Marshal(map[string]any{"error": map[string]any{"message": err.Error(), "type": "invalid_request_error"}})
+	if marshalErr != nil {
+		return []byte("{\"error\":{\"message\":\"failed to encode response\",\"type\":\"invalid_request_error\"}}\n")
+	}
+	if len(encoded) == 0 || encoded[len(encoded)-1] != '\n' {
+		encoded = append(encoded, '\n')
+	}
+	return encoded
 }
 
 func tokensForExchange(requestedModel, resolvedModel, requestText string, response app.ChatResponse) (int, int, int, domain.TokenSource) {

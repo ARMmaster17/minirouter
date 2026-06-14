@@ -168,6 +168,11 @@ func applyEnvOverrides(cfg *Config) {
 			cfg.Routing.Debug = parsed
 		}
 	}
+	if value := os.Getenv("MINIROUTER_PAYLOAD_DEBUG"); value != "" {
+		if parsed, err := strconv.ParseBool(value); err == nil {
+			cfg.Routing.PayloadDebug = parsed
+		}
+	}
 	for index := range cfg.Providers {
 		provider := &cfg.Providers[index]
 		prefix := strings.ToUpper(provider.Name)

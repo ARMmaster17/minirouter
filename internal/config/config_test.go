@@ -12,6 +12,7 @@ func TestLoadAppliesEnvironmentOverrides(t *testing.T) {
 	t.Setenv("MINIROUTER_INCOMING_API_KEY", "incoming-from-env")
 	t.Setenv("MINIROUTER_ROUTING_CONFIDENCE_THRESHOLD", "0.77")
 	t.Setenv("MINIROUTER_ROUTING_DEBUG", "true")
+	t.Setenv("MINIROUTER_PAYLOAD_DEBUG", "true")
 	t.Setenv("MINIROUTER_GEMINI_API_KEY", "env-key")
 	t.Setenv("MINIROUTER_GEMINI_URL", "https://example.invalid")
 
@@ -54,6 +55,9 @@ func TestLoadAppliesEnvironmentOverrides(t *testing.T) {
 	}
 	if !cfg.Routing.Debug {
 		t.Fatalf("expected routing debug override to be true")
+	}
+	if !cfg.Routing.PayloadDebug {
+		t.Fatalf("expected payload debug override to be true")
 	}
 	if len(cfg.Providers) != 1 {
 		t.Fatalf("expected 1 provider, got %d", len(cfg.Providers))

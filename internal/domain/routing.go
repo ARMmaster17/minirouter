@@ -85,6 +85,7 @@ type FailureRoutingConfig struct {
 type RoutingConfig struct {
 	Version      string               `json:"version"`
 	Debug        bool                 `json:"debug"`
+	PayloadDebug bool                 `json:"payloadDebug"`
 	Scoring      ScoringConfig        `json:"scoring"`
 	Tiers        map[Tier]TierConfig  `json:"tiers"`
 	AgenticTiers map[Tier]TierConfig  `json:"agenticTiers"`

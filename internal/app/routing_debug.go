@@ -17,6 +17,10 @@ func (r *Router) routingDebugEnabled() bool {
 	return r.Config.Routing.Debug
 }
 
+func (r *Router) payloadDebugEnabled() bool {
+	return r.Config.Routing.PayloadDebug
+}
+
 func (r *Router) debugRouting(event string, payload any) {
 	if !r.routingDebugEnabled() {
 		return
@@ -27,6 +31,13 @@ func (r *Router) debugRouting(event string, payload any) {
 		return
 	}
 	fmt.Fprintf(os.Stdout, "[routing-debug] %s\n%s\n", event, encoded)
+}
+
+func (r *Router) debugPayload(event string, payload []byte) {
+	if !r.payloadDebugEnabled() {
+		return
+	}
+	fmt.Fprintf(os.Stdout, "[payload-debug] %s\n%s\n", event, payload)
 }
 
 func (r *Router) tierCandidatesForTier(tier domain.Tier, estimatedInputTokens int) ([]string, map[string]Model, []tierCandidateSkip) {

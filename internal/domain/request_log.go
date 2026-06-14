@@ -37,6 +37,8 @@ type RequestLogEntry struct {
 	TokenSource      TokenSource   `json:"tokenSource"`
 	RequestBytes     int           `json:"requestBytes"`
 	ResponseBytes    int           `json:"responseBytes"`
+	RawRequest       string        `json:"rawRequest,omitempty"`
+	RawResponse      string        `json:"rawResponse,omitempty"`
 	Duration         time.Duration `json:"duration"`
 }
 
