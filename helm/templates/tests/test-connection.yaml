@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ include "minirouter.fullname" . }}-test-connection"
+  labels:
+    {{- include "minirouter.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+spec:
+  containers:
+    - name: wget
+      image: busybox
+      command: ['wget']
+      args: ['{{ include "minirouter.fullname" . }}:8080']
+  restartPolicy: Never

@@ -1,0 +1,161 @@
+# -- Number of replicas (manual scaling only, no HPA)
+replicaCount: 1
+
+image:
+  repository: ghcr.io/armmaster17/minirouter
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  automount: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext: {}
+securityContext: {}
+
+service:
+  type: ClusterIP
+  port: 8080
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: chart-example.local
+      paths:
+        - path: /
+          pathType: ImplementationSpecific
+  tls: []
+
+httpRoute:
+  enabled: false
+  annotations: {}
+  parentRefs:
+  - name: gateway
+    sectionName: http
+  hostnames:
+  - chart-example.local
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /headers
+
+resources: {}
+
+livenessProbe:
+  httpGet:
+    path: /health
+    port: http
+readinessProbe:
+  httpGet:
+    path: /health
+    port: http
+
+# No autoscaling – manual replicaCount only
+autoscaling:
+  enabled: false
+
+# -- Application configuration (written to config.json and mounted as a ConfigMap)
+# See https://github.com/ARMmaster17/minirouter for full reference.
+config:
+  server:
+    addr: ":8080"
+    frontendEnabled: true
+    # WARNING: incomingAPIKey is stored in a ConfigMap (not a Secret).
+    # Replace with a Secret for production use.
+    incomingAPIKey: ""
+  routing:
+    version: v1
+    debug: false
+    payloadDebug: false
+    scoring:
+      tokenCountThresholds:
+        simple: 400
+        complex: 1600
+      confidenceSteepness: 8
+      confidenceThreshold: 0.65
+      tierBoundaries:
+        simpleMedium: -0.10
+        mediumComplex: 0.18
+        complexReasoning: 0.42
+      dimensionWeights:
+        tokenCount: 0.30
+        codePresence: 0.35
+        reasoningMarkers: 0.30
+        technicalTerms: 0.20
+        creativeMarkers: 0.12
+        simpleIndicators: 0.18
+        multiStepPatterns: 0.12
+        questionComplexity: 0.10
+        imperativeVerbs: 0.10
+        constraintCount: 0.15
+        outputFormat: 0.12
+        referenceComplexity: 0.08
+        negationComplexity: 0.08
+        domainSpecificity: 0.12
+        agenticTask: 0.20
+      codeKeywords: ["code", "function", "type", "interface", "api", "compile", "error", "bug"]
+      reasoningKeywords: ["reason", "explain", "analyze", "why", "tradeoff"]
+      simpleKeywords: ["simple", "quick", "brief", "summarize"]
+      technicalKeywords: ["go", "http", "json", "grpc", "sql", "docker", "kubernetes"]
+      creativeKeywords: ["write", "story", "poem", "brainstorm", "design"]
+      imperativeVerbs: ["build", "create", "implement", "fix", "add"]
+      constraintIndicators: ["must", "should", "only", "exactly", "without"]
+      outputFormatKeywords: ["json", "yaml", "table", "code", "markdown"]
+      referenceKeywords: ["this", "that", "above", "below", "file"]
+      negationKeywords: ["not", "never", "without", "except"]
+      domainSpecificKeywords: ["router", "model", "provider", "streaming", "fallback"]
+      agenticTaskKeywords: ["plan", "iterate", "refactor", "deploy", "test"]
+    tiers:
+      simple:
+        models: ["openai:default"]
+      medium:
+        models: ["openai:default"]
+      complex:
+        models: ["openai:default"]
+      reasoning:
+        models: ["openai:default"]
+    failures:
+      default:
+        tierSwitch: none
+      timeout:
+        retry: 1
+        tierSwitch: none
+      rateLimit:
+        retry: 1
+        tierSwitch: none
+      unavailable:
+        tierSwitch: none
+      serverError:
+        tierSwitch: none
+    overrides:
+      maxTokensForceComplex: 8000
+      structuredOutputMinTier: medium
+      ambiguousDefaultTier: medium
+  providers: []
+    # Example provider (WARNING: apiKey is in ConfigMap, not Secret):
+    # - kind: openai
+    #   name: openai
+    #   apiKey: "sk-..."
+    #   url: "https://api.openai.com/v1"
+    #   enabled: true
+    #   models:
+    #     - id: gpt-4o-mini
+    #     - id: gpt-4o
+
+volumes: []
+volumeMounts: []
+nodeSelector: {}
+tolerations: []
+affinity: {}

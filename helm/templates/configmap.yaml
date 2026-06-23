@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "minirouter.fullname" . }}-config
+  labels:
+    {{- include "minirouter.labels" . | nindent 4 }}
+data:
+  config.json: |
+{{ mustToJson .Values.config | indent 4 }}
