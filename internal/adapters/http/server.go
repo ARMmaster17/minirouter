@@ -339,35 +339,16 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	written := 0
-	var responseBody []byte
-	if len(response.RawJSON) > 0 {
-		responseBody = append([]byte(nil), response.RawJSON...)
-		if len(responseBody) == 0 || responseBody[len(responseBody)-1] != '\n' {
-			responseBody = append(responseBody, '\n')
-		}
-		written = writeJSONBytes(w, http.StatusOK, response.RawJSON)
-	} else {
-		content := response.Content
-		payload := map[string]any{
-			"id":         fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()),
-			"object":     "chat.completion",
-			"created":    time.Now().Unix(),
-			"model":      response.Model,
-			"tier":       result.Tier,
-			"confidence": result.Confidence,
-			"choices": []map[string]any{{
-				"index":         0,
-				"message":       map[string]any{"role": "assistant", "content": content},
-				"finish_reason": "stop",
-			}},
-		}
-		encoded, marshalErr := json.Marshal(payload)
-		if marshalErr != nil {
-			encoded = []byte(`{"error":{"message":"failed to encode response","type":"invalid_request_error"}}`)
-		}
-		responseBody = append(encoded, '\n')
-		written = writeJSON(w, http.StatusOK, payload)
+	payload := response.Completion
+	if payload == nil {
+		payload = app.NewTextCompletion(response.Model, "")
 	}
+	encoded, marshalErr := json.Marshal(payload)
+	responseBody := []byte(`{"error":{"message":"failed to encode response","type":"invalid_request_error"}}\n`)
+	if marshalErr == nil {
+		responseBody = append(encoded, '\n')
+	}
+	written = writeJSON(w, http.StatusOK, payload)
 	s.debugPayload("request", bodyBytes)
 	s.debugPayload("response", responseBody)
 	s.logRequest(r, requestedModel, response.Model, extractRequestText(req), result, response, http.StatusOK, len(bodyBytes), written, bodyBytes, responseBody, startedAt, nil)
@@ -450,37 +431,37 @@ func (s *Server) handleChatCompletionsStream(w http.ResponseWriter, r *http.Requ
 			created := time.Now().Unix()
 			id := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 
-			roleChunk := map[string]any{
-				"id":      id,
-				"object":  "chat.completion.chunk",
-				"created": created,
-				"model":   responseModel,
-				"choices": []map[string]any{{
-					"index":         0,
-					"delta":         map[string]any{"role": "assistant"},
-					"finish_reason": nil,
+			roleChunk := app.OpenAIChatCompletionChunk{
+				ID:      id,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   responseModel,
+				Choices: []app.OpenAIChatChunkChoice{{
+					Index:        0,
+					Delta:        app.OpenAIChatDelta{Role: "assistant"},
+					FinishReason: nil,
 				}},
 			}
-			contentChunk := map[string]any{
-				"id":      id,
-				"object":  "chat.completion.chunk",
-				"created": created,
-				"model":   responseModel,
-				"choices": []map[string]any{{
-					"index":         0,
-					"delta":         map[string]any{"content": outcome.response.Content},
-					"finish_reason": nil,
+			contentChunk := app.OpenAIChatCompletionChunk{
+				ID:      id,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   responseModel,
+				Choices: []app.OpenAIChatChunkChoice{{
+					Index:        0,
+					Delta:        app.OpenAIChatDelta{Content: outcome.response.AssistantText()},
+					FinishReason: nil,
 				}},
 			}
-			stopChunk := map[string]any{
-				"id":      id,
-				"object":  "chat.completion.chunk",
-				"created": created,
-				"model":   responseModel,
-				"choices": []map[string]any{{
-					"index":         0,
-					"delta":         map[string]any{},
-					"finish_reason": "stop",
+			stopChunk := app.OpenAIChatCompletionChunk{
+				ID:      id,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   responseModel,
+				Choices: []app.OpenAIChatChunkChoice{{
+					Index:        0,
+					Delta:        app.OpenAIChatDelta{},
+					FinishReason: "stop",
 				}},
 			}
 
@@ -616,7 +597,17 @@ func writeStreamingResponse(w http.ResponseWriter, model, content string) int {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	flusher, _ := w.(http.Flusher)
-	payload := map[string]any{"id": fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()), "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []map[string]any{{"index": 0, "delta": map[string]any{"role": "assistant", "content": content}, "finish_reason": nil}}}
+	payload := app.OpenAIChatCompletionChunk{
+		ID:      fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()),
+		Object:  "chat.completion.chunk",
+		Created: time.Now().Unix(),
+		Model:   model,
+		Choices: []app.OpenAIChatChunkChoice{{
+			Index:        0,
+			Delta:        app.OpenAIChatDelta{Role: "assistant", Content: content},
+			FinishReason: nil,
+		}},
+	}
 	encoded, _ := json.Marshal(payload)
 	n1, _ := fmt.Fprintf(w, "data: %s\n\n", encoded)
 	n2, _ := fmt.Fprint(w, "data: [DONE]\n\n")
@@ -945,13 +936,14 @@ func tokensForExchange(requestedModel, resolvedModel, requestText string, respon
 		modelForTokenizer = requestedModel
 	}
 	prompt, promptOK := countTokensWithTokenizer(modelForTokenizer, requestText)
-	completion, completionOK := countTokensWithTokenizer(modelForTokenizer, response.Content)
+	completionText := response.AssistantText()
+	completion, completionOK := countTokensWithTokenizer(modelForTokenizer, completionText)
 	if promptOK || completionOK {
 		total := prompt + completion
 		return prompt, completion, total, domain.TokenSourceTokenizer
 	}
 	prompt = heuristicTokenCount(requestText)
-	completion = heuristicTokenCount(response.Content)
+	completion = heuristicTokenCount(completionText)
 	return prompt, completion, prompt + completion, domain.TokenSourceHeuristic
 }
 

@@ -23,8 +23,11 @@ func TestMockProviderStaticModelsAndResponses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if response.Content != "hello" {
-		t.Fatalf("expected configured response, got %q", response.Content)
+	if response.Completion == nil {
+		t.Fatalf("expected typed completion on response")
+	}
+	if response.AssistantText() != "hello" {
+		t.Fatalf("expected configured response, got %q", response.AssistantText())
 	}
 }
 

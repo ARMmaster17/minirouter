@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/ARMmaster17/minirouter/internal/app"
 )
@@ -106,21 +107,6 @@ func (p *OpenAIProvider) Models(ctx context.Context) ([]app.Model, error) {
 }
 
 func (p *OpenAIProvider) ChatCompletions(ctx context.Context, req app.ChatRequest) (app.ChatResponse, error) {
-	type chatChoice struct {
-		Message struct {
-			Content app.ChatMessageContent `json:"content"`
-		} `json:"message"`
-	}
-	type chatResponse struct {
-		Model   string       `json:"model"`
-		Choices []chatChoice `json:"choices"`
-		Usage   struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
-			TotalTokens      int `json:"total_tokens"`
-		} `json:"usage"`
-	}
-
 	model := splitModelID(p.providerID, req.Model)
 	body, err := req.ForwardedOpenAIFields(model, false)
 	if err != nil {
@@ -131,26 +117,38 @@ func (p *OpenAIProvider) ChatCompletions(ctx context.Context, req app.ChatReques
 	if err != nil {
 		return app.ChatResponse{}, err
 	}
-	var response chatResponse
+	var response app.OpenAIChatCompletionResponse
 	if err := json.Unmarshal(rawResponse, &response); err != nil {
 		return app.ChatResponse{}, err
-	}
-	content := ""
-	if len(response.Choices) > 0 {
-		content = response.Choices[0].Message.Content.TextValue()
 	}
 	if strings.TrimSpace(response.Model) == "" {
 		response.Model = model
 	}
 	usage := &app.ChatUsage{
-		PromptTokens:     response.Usage.PromptTokens,
-		CompletionTokens: response.Usage.CompletionTokens,
-		TotalTokens:      response.Usage.TotalTokens,
+		PromptTokens:     0,
+		CompletionTokens: 0,
+		TotalTokens:      0,
+	}
+	if response.Usage != nil {
+		usage.PromptTokens = response.Usage.PromptTokens
+		usage.CompletionTokens = response.Usage.CompletionTokens
+		usage.TotalTokens = response.Usage.TotalTokens
 	}
 	if usage.PromptTokens == 0 && usage.CompletionTokens == 0 && usage.TotalTokens == 0 {
 		usage = nil
 	}
-	return app.ChatResponse{Model: app.ProviderModelID(p.providerID, response.Model), Content: content, Usage: usage, RawJSON: rawResponse}, nil
+	providerModel := app.ProviderModelID(p.providerID, response.Model)
+	response.Model = providerModel
+	if response.ID == "" {
+		response.ID = fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
+	}
+	if response.Object == "" {
+		response.Object = "chat.completion"
+	}
+	if response.Created == 0 {
+		response.Created = time.Now().Unix()
+	}
+	return app.ChatResponse{Model: providerModel, Completion: &response, Usage: usage}, nil
 }
 
 func (p *OpenAIProvider) ChatCompletionsStream(ctx context.Context, req app.ChatRequest) (app.ChatStreamResponse, error) {

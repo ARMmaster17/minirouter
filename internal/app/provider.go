@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 )
 
 type ChatContentPart struct {
@@ -77,21 +78,100 @@ type ChatMessage struct {
 	ToolCallID string             `json:"tool_call_id,omitempty"`
 }
 
+type ChatFunctionDefinition struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Parameters  json.RawMessage `json:"parameters,omitempty"`
+	Strict      *bool           `json:"strict,omitempty"`
+}
+
+type ChatTool struct {
+	Type     string                  `json:"type"`
+	Function *ChatFunctionDefinition `json:"function,omitempty"`
+}
+
+type ChatResponseFormatJSONSchema struct {
+	Name        string          `json:"name,omitempty"`
+	Description string          `json:"description,omitempty"`
+	Schema      json.RawMessage `json:"schema,omitempty"`
+	Strict      *bool           `json:"strict,omitempty"`
+}
+
+type ChatResponseFormat struct {
+	Type       string                        `json:"type,omitempty"`
+	JSONSchema *ChatResponseFormatJSONSchema `json:"json_schema,omitempty"`
+}
+
+type ChatStopSequences struct {
+	Values []string
+}
+
+func (s *ChatStopSequences) UnmarshalJSON(data []byte) error {
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" || trimmed == "null" {
+		s.Values = nil
+		return nil
+	}
+	var single string
+	if err := json.Unmarshal(data, &single); err == nil {
+		if strings.TrimSpace(single) == "" {
+			s.Values = nil
+			return nil
+		}
+		s.Values = []string{single}
+		return nil
+	}
+	var many []string
+	if err := json.Unmarshal(data, &many); err == nil {
+		s.Values = many
+		return nil
+	}
+	return fmt.Errorf("unsupported stop format")
+}
+
+func (s ChatStopSequences) MarshalJSON() ([]byte, error) {
+	if len(s.Values) == 0 {
+		return []byte("null"), nil
+	}
+	if len(s.Values) == 1 {
+		return json.Marshal(s.Values[0])
+	}
+	return json.Marshal(s.Values)
+}
+
 type ChatRequest struct {
 	Model                string                     `json:"model"`
 	Prompt               string                     `json:"prompt"`
 	Stream               bool                       `json:"stream"`
 	Messages             []ChatMessage              `json:"messages"`
+	Temperature          *float32                   `json:"temperature,omitempty"`
+	TopP                 *float32                   `json:"top_p,omitempty"`
+	MaxTokens            *int                       `json:"max_tokens,omitempty"`
+	MaxCompletionTokens  *int                       `json:"max_completion_tokens,omitempty"`
+	Stop                 ChatStopSequences          `json:"stop,omitempty"`
+	Tools                []ChatTool                 `json:"tools,omitempty"`
+	ToolChoice           json.RawMessage            `json:"tool_choice,omitempty"`
+	ResponseFormat       *ChatResponseFormat        `json:"response_format,omitempty"`
+	ParallelToolCalls    *bool                      `json:"parallel_tool_calls,omitempty"`
 	EstimatedInputTokens *int                       `json:"-"`
 	RawFields            map[string]json.RawMessage `json:"-"`
 }
 
 func (r *ChatRequest) UnmarshalJSON(data []byte) error {
 	type alias struct {
-		Model    string        `json:"model"`
-		Prompt   string        `json:"prompt"`
-		Stream   bool          `json:"stream"`
-		Messages []ChatMessage `json:"messages"`
+		Model               string              `json:"model"`
+		Prompt              string              `json:"prompt"`
+		Stream              bool                `json:"stream"`
+		Messages            []ChatMessage       `json:"messages"`
+		Temperature         *float32            `json:"temperature,omitempty"`
+		TopP                *float32            `json:"top_p,omitempty"`
+		MaxTokens           *int                `json:"max_tokens,omitempty"`
+		MaxCompletionTokens *int                `json:"max_completion_tokens,omitempty"`
+		Stop                ChatStopSequences   `json:"stop,omitempty"`
+		Tools               []ChatTool          `json:"tools,omitempty"`
+		ToolChoice          json.RawMessage     `json:"tool_choice,omitempty"`
+		ResponseFormat      *ChatResponseFormat `json:"response_format,omitempty"`
+		ParallelToolCalls   *bool               `json:"parallel_tool_calls,omitempty"`
 	}
 	var decoded alias
 	if err := json.Unmarshal(data, &decoded); err != nil {
@@ -105,12 +185,22 @@ func (r *ChatRequest) UnmarshalJSON(data []byte) error {
 	r.Prompt = decoded.Prompt
 	r.Stream = decoded.Stream
 	r.Messages = decoded.Messages
+	r.Temperature = decoded.Temperature
+	r.TopP = decoded.TopP
+	r.MaxTokens = decoded.MaxTokens
+	r.MaxCompletionTokens = decoded.MaxCompletionTokens
+	r.Stop = decoded.Stop
+	r.Tools = decoded.Tools
+	r.ToolChoice = decoded.ToolChoice
+	r.ResponseFormat = decoded.ResponseFormat
+	r.ParallelToolCalls = decoded.ParallelToolCalls
 	r.RawFields = raw
 	return nil
 }
 
 func (r ChatRequest) ForwardedOpenAIFields(model string, stream bool) (map[string]json.RawMessage, error) {
 	if len(r.RawFields) == 0 {
+		out := map[string]json.RawMessage{}
 		messages, err := json.Marshal(r.defaultOpenAIMessages())
 		if err != nil {
 			return nil, err
@@ -123,11 +213,70 @@ func (r ChatRequest) ForwardedOpenAIFields(model string, stream bool) (map[strin
 		if err != nil {
 			return nil, err
 		}
-		return map[string]json.RawMessage{
-			"model":    modelValue,
-			"messages": messages,
-			"stream":   streamValue,
-		}, nil
+		out["model"] = modelValue
+		out["messages"] = messages
+		out["stream"] = streamValue
+		if r.Temperature != nil {
+			value, err := json.Marshal(*r.Temperature)
+			if err != nil {
+				return nil, err
+			}
+			out["temperature"] = value
+		}
+		if r.TopP != nil {
+			value, err := json.Marshal(*r.TopP)
+			if err != nil {
+				return nil, err
+			}
+			out["top_p"] = value
+		}
+		if r.MaxCompletionTokens != nil {
+			value, err := json.Marshal(*r.MaxCompletionTokens)
+			if err != nil {
+				return nil, err
+			}
+			out["max_completion_tokens"] = value
+		} else if r.MaxTokens != nil {
+			value, err := json.Marshal(*r.MaxTokens)
+			if err != nil {
+				return nil, err
+			}
+			out["max_tokens"] = value
+		}
+		if len(r.Stop.Values) > 0 {
+			value, err := json.Marshal(r.Stop)
+			if err != nil {
+				return nil, err
+			}
+			out["stop"] = value
+		}
+		if len(r.Tools) > 0 {
+			value, err := json.Marshal(r.Tools)
+			if err != nil {
+				return nil, err
+			}
+			out["tools"] = value
+		}
+		if len(r.ToolChoice) > 0 {
+			choice := make(json.RawMessage, len(r.ToolChoice))
+			copy(choice, r.ToolChoice)
+			out["tool_choice"] = choice
+		}
+		if r.ResponseFormat != nil {
+			value, err := json.Marshal(r.ResponseFormat)
+			if err != nil {
+				return nil, err
+			}
+			out["response_format"] = value
+		}
+		if r.ParallelToolCalls != nil {
+			value, err := json.Marshal(*r.ParallelToolCalls)
+			if err != nil {
+				return nil, err
+			}
+			out["parallel_tool_calls"] = value
+		}
+		return out, nil
 	}
 	out := make(map[string]json.RawMessage, len(r.RawFields)+1)
 	for key, value := range r.RawFields {
@@ -177,16 +326,97 @@ func (r ChatRequest) defaultOpenAIMessages() []map[string]any {
 }
 
 type ChatResponse struct {
-	Model   string
-	Content string
-	Usage   *ChatUsage
-	RawJSON json.RawMessage
+	Model      string
+	Completion *OpenAIChatCompletionResponse
+	Usage      *ChatUsage
 }
 
 type ChatUsage struct {
 	PromptTokens     int
 	CompletionTokens int
 	TotalTokens      int
+}
+
+type OpenAIChatToolFunction struct {
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments,omitempty"`
+}
+
+type OpenAIChatToolCall struct {
+	ID       string                 `json:"id,omitempty"`
+	Type     string                 `json:"type,omitempty"`
+	Function OpenAIChatToolFunction `json:"function"`
+}
+
+type OpenAIChatMessage struct {
+	Role      string               `json:"role,omitempty"`
+	Content   ChatMessageContent   `json:"content,omitempty"`
+	ToolCalls []OpenAIChatToolCall `json:"tool_calls,omitempty"`
+}
+
+type OpenAIChatChoice struct {
+	Index        int               `json:"index"`
+	Message      OpenAIChatMessage `json:"message"`
+	FinishReason string            `json:"finish_reason,omitempty"`
+}
+
+type OpenAIChatCompletionUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+}
+
+type OpenAIChatCompletionResponse struct {
+	ID      string                     `json:"id,omitempty"`
+	Object  string                     `json:"object,omitempty"`
+	Created int64                      `json:"created,omitempty"`
+	Model   string                     `json:"model,omitempty"`
+	Choices []OpenAIChatChoice         `json:"choices,omitempty"`
+	Usage   *OpenAIChatCompletionUsage `json:"usage,omitempty"`
+}
+
+type OpenAIChatDelta struct {
+	Role      string               `json:"role,omitempty"`
+	Content   string               `json:"content,omitempty"`
+	ToolCalls []OpenAIChatToolCall `json:"tool_calls,omitempty"`
+}
+
+type OpenAIChatChunkChoice struct {
+	Index        int             `json:"index"`
+	Delta        OpenAIChatDelta `json:"delta"`
+	FinishReason any             `json:"finish_reason"`
+}
+
+type OpenAIChatCompletionChunk struct {
+	ID      string                  `json:"id,omitempty"`
+	Object  string                  `json:"object,omitempty"`
+	Created int64                   `json:"created,omitempty"`
+	Model   string                  `json:"model,omitempty"`
+	Choices []OpenAIChatChunkChoice `json:"choices,omitempty"`
+}
+
+func (r ChatResponse) AssistantText() string {
+	if r.Completion == nil || len(r.Completion.Choices) == 0 {
+		return ""
+	}
+	return r.Completion.Choices[0].Message.Content.TextValue()
+}
+
+func NewTextCompletion(model, content string) *OpenAIChatCompletionResponse {
+	return &OpenAIChatCompletionResponse{
+		ID:      fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()),
+		Object:  "chat.completion",
+		Created: time.Now().Unix(),
+		Model:   model,
+		Choices: []OpenAIChatChoice{{
+			Index: 0,
+			Message: OpenAIChatMessage{
+				Role:    "assistant",
+				Content: ChatMessageContent{Text: content},
+			},
+			FinishReason: "stop",
+		}},
+	}
 }
 
 type ChatStreamResponse struct {
@@ -303,11 +533,12 @@ func (p *MockProvider) ChatCompletions(_ context.Context, req ChatRequest) (Chat
 		return ChatResponse{}, errors.New(message)
 	}
 	if content, ok := p.responses[strings.TrimSpace(req.Model)]; ok {
-		return ChatResponse{Model: req.Model, Content: content}, nil
+		return ChatResponse{Model: req.Model, Completion: NewTextCompletion(req.Model, content)}, nil
 	}
 	prompt := req.Prompt
 	if prompt == "" && len(req.Messages) > 0 {
 		prompt = req.Messages[len(req.Messages)-1].Content.TextValue()
 	}
-	return ChatResponse{Model: req.Model, Content: fmt.Sprintf("mock:%s:%s", req.Model, prompt)}, nil
+	content := fmt.Sprintf("mock:%s:%s", req.Model, prompt)
+	return ChatResponse{Model: req.Model, Completion: NewTextCompletion(req.Model, content)}, nil
 }

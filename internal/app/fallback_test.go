@@ -25,8 +25,8 @@ func TestChatFallsBackToBackupModel(t *testing.T) {
 	if response.Model != "mock:backup:backup-chat" {
 		t.Fatalf("expected fallback model, got %s", response.Model)
 	}
-	if response.Content != "backup response" {
-		t.Fatalf("expected fallback response, got %q", response.Content)
+	if response.AssistantText() != "backup response" {
+		t.Fatalf("expected fallback response, got %q", response.AssistantText())
 	}
 }
 

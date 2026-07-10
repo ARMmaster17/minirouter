@@ -165,11 +165,11 @@ func (r *Router) ResolveModel(requestModel, prompt string, estimatedInputTokens 
 	if requestModel != "" && (requestModel != "auto" && !strings.HasPrefix(requestModel, "auto-")) {
 		if metadata := r.modelMetadataByID(); metadata[requestModel].ID != "" {
 			r.debugRouting("explicit_model", map[string]any{
-				"requestModel":          requestModel,
-				"resolvedModel":         requestModel,
-				"estimatedInputTokens":  estimatedInputTokens,
-				"result":                domain.ScoringResult{Tier: domain.TierReasoning, Confidence: 1},
-				"decision":              "request model bypassed auto routing",
+				"requestModel":         requestModel,
+				"resolvedModel":        requestModel,
+				"estimatedInputTokens": estimatedInputTokens,
+				"result":               domain.ScoringResult{Tier: domain.TierReasoning, Confidence: 1},
+				"decision":             "request model bypassed auto routing",
 			})
 			return requestModel, domain.ScoringResult{Tier: domain.TierReasoning, Confidence: 1}, nil
 		}
@@ -240,7 +240,7 @@ func (r *Router) Chat(ctx context.Context, req ChatRequest) (ChatResponse, domai
 	}
 	req.Model = resolvedModel
 	if r.Providers == nil {
-		return ChatResponse{Model: resolvedModel, Content: "no provider registry configured"}, result, nil
+		return ChatResponse{Model: resolvedModel, Completion: NewTextCompletion(resolvedModel, "no provider registry configured")}, result, nil
 	}
 	startTier := r.resolveRequestTier(resolvedModel, result, estimatedInputTokens)
 	response, err := r.chatWithTierFallbacks(ctx, req, startTier, estimatedInputTokens, map[domain.Tier]struct{}{}, map[string]struct{}{})
@@ -343,8 +343,8 @@ func (r *Router) chatWithTierFallbacks(ctx context.Context, req ChatRequest, tie
 		attemptReq := req
 		attemptReq.Model = candidate
 		r.debugRouting("chat_attempt", map[string]any{
-			"tier":      tier,
-			"model":     candidate,
+			"tier":       tier,
+			"model":      candidate,
 			"attemptReq": map[string]any{"stream": attemptReq.Stream, "messages": len(attemptReq.Messages)},
 		})
 		response, policy, err := r.chatModelWithPolicy(ctx, attemptReq)
@@ -360,10 +360,10 @@ func (r *Router) chatWithTierFallbacks(ctx context.Context, req ChatRequest, tie
 		lastErr = err
 		lastPolicy = policy
 		r.debugRouting("chat_attempt_result", map[string]any{
-			"tier":         tier,
-			"model":        candidate,
-			"result":       "failure",
-			"error":        err.Error(),
+			"tier":          tier,
+			"model":         candidate,
+			"result":        "failure",
+			"error":         err.Error(),
 			"failurePolicy": policy,
 		})
 		if !failurePolicyTierNext(policy) {
@@ -385,9 +385,9 @@ func (r *Router) chatWithTierFallbacks(ctx context.Context, req ChatRequest, tie
 			return ChatResponse{}, lastErr
 		}
 		r.debugRouting("tier_fallback", map[string]any{
-			"fromTier":     tier,
-			"toTier":       nextTier,
-			"error":        lastErr.Error(),
+			"fromTier":      tier,
+			"toTier":        nextTier,
+			"error":         lastErr.Error(),
 			"failurePolicy": lastPolicy,
 		})
 		nextReq := req

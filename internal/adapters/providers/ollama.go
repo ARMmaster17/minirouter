@@ -146,5 +146,7 @@ func (p *OllamaProvider) ChatCompletions(ctx context.Context, req app.ChatReques
 	if usage.PromptTokens == 0 && usage.CompletionTokens == 0 && usage.TotalTokens == 0 {
 		usage = nil
 	}
-	return app.ChatResponse{Model: app.ProviderModelID(p.providerID, response.Model), Content: response.Message.Content, Usage: usage}, nil
+	providerModel := app.ProviderModelID(p.providerID, response.Model)
+	completion := app.NewTextCompletion(providerModel, response.Message.Content)
+	return app.ChatResponse{Model: providerModel, Completion: completion, Usage: usage}, nil
 }

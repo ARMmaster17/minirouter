@@ -35,8 +35,11 @@ func TestOpenAIProviderModelsAndChat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if response.Content != "ok" {
-		t.Fatalf("unexpected content: %s", response.Content)
+	if response.Completion == nil {
+		t.Fatalf("expected typed completion response")
+	}
+	if response.AssistantText() != "ok" {
+		t.Fatalf("unexpected content: %s", response.AssistantText())
 	}
 }
 
@@ -63,8 +66,11 @@ func TestOllamaProviderModelsAndChat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if response.Content != "ollama-ok" {
-		t.Fatalf("unexpected content: %s", response.Content)
+	if response.Completion == nil {
+		t.Fatalf("expected typed completion response")
+	}
+	if response.AssistantText() != "ollama-ok" {
+		t.Fatalf("unexpected content: %s", response.AssistantText())
 	}
 }
 
@@ -79,20 +85,23 @@ func TestGeminiProviderModelsAndChat(t *testing.T) {
 	server := httptest.NewServer(mux)
 	defer server.Close()
 
-	provider := NewGeminiProvider("gemini:cloud", server.URL+"/v1beta", "", []app.Model{{ID: "gemini:cloud:gemini-2.5-flash"}})
+	provider := NewGeminiProvider("gemini:cloud", server.URL+"/v1beta", "test-key", []app.Model{{ID: "gemini:cloud:models/gemini-2.5-flash"}})
 	models, err := provider.Models(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(models) != 1 || models[0].ID != "gemini:cloud:gemini-2.5-flash" {
+	if len(models) != 1 || models[0].ID != "gemini:cloud:models/gemini-2.5-flash" {
 		t.Fatalf("unexpected models: %+v", models)
 	}
-	response, err := provider.ChatCompletions(context.Background(), app.ChatRequest{Model: "gemini:cloud:gemini-2.5-flash", Prompt: "hi"})
+	response, err := provider.ChatCompletions(context.Background(), app.ChatRequest{Model: "gemini:cloud:models/gemini-2.5-flash", Prompt: "hi"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if response.Content != "gemini-ok" {
-		t.Fatalf("unexpected content: %s", response.Content)
+	if response.Completion == nil {
+		t.Fatalf("expected typed completion response")
+	}
+	if response.AssistantText() != "gemini-ok" {
+		t.Fatalf("unexpected content: %s", response.AssistantText())
 	}
 }
 
@@ -112,8 +121,11 @@ func TestLMStudioProviderUsesOpenAICompatibility(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if response.Content != "lmstudio-ok" {
-		t.Fatalf("unexpected content: %s", response.Content)
+	if response.Completion == nil {
+		t.Fatalf("expected typed completion response")
+	}
+	if response.AssistantText() != "lmstudio-ok" {
+		t.Fatalf("unexpected content: %s", response.AssistantText())
 	}
 }
 
@@ -202,12 +214,12 @@ func TestGeminiProviderConfiguredModelsAreAllowlist(t *testing.T) {
 	server := httptest.NewServer(mux)
 	defer server.Close()
 
-	provider := NewGeminiProvider("gemini:test", server.URL+"/v1beta", "", []app.Model{{ID: "gemini:test:gemini-b"}})
+	provider := NewGeminiProvider("gemini:test", server.URL+"/v1beta", "test-key", []app.Model{{ID: "gemini:test:models/gemini-b"}})
 	models, err := provider.Models(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(models) != 1 || models[0].ID != "gemini:test:gemini-b" {
+	if len(models) != 1 || models[0].ID != "gemini:test:models/gemini-b" {
 		t.Fatalf("expected allowlist to include only configured model, got %+v", models)
 	}
 }
@@ -284,10 +296,156 @@ func TestOpenAIProviderForwardsFullChatPayload(t *testing.T) {
 	if !ok || len(messages) != 1 {
 		t.Fatalf("expected forwarded messages, got %+v", captured["messages"])
 	}
-	if response.RawJSON == nil || !strings.Contains(string(response.RawJSON), "tool_calls") {
-		t.Fatalf("expected raw response to preserve tool_calls, got %s", string(response.RawJSON))
+	if response.Completion == nil {
+		t.Fatalf("expected typed completion response")
+	}
+	if len(response.Completion.Choices) != 1 {
+		t.Fatalf("expected one choice in response, got %+v", response.Completion.Choices)
+	}
+	if len(response.Completion.Choices[0].Message.ToolCalls) != 1 {
+		t.Fatalf("expected typed response to preserve tool_calls, got %+v", response.Completion.Choices[0].Message.ToolCalls)
 	}
 	if response.Model != "openai:test:gpt-4o-mini" {
 		t.Fatalf("expected provider-prefixed response model, got %s", response.Model)
+	}
+}
+
+func TestGeminiProviderTranslatesToolChoiceAndResponseFormat(t *testing.T) {
+	var captured map[string]any
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1beta/models/gemini-2.5-flash:generateContent", func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read request body: %v", err)
+		}
+		if err := json.Unmarshal(bodyBytes, &captured); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"candidates": []map[string]any{{
+				"content":      map[string]any{"parts": []map[string]any{{"text": "ok"}}},
+				"finishReason": "STOP",
+			}},
+			"usageMetadata": map[string]any{
+				"promptTokenCount":     10,
+				"candidatesTokenCount": 4,
+				"totalTokenCount":      14,
+			},
+		})
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	var req app.ChatRequest
+	body := []byte(`{"model":"gemini:test:models/gemini-2.5-flash","messages":[{"role":"user","content":"hello"}],"tools":[{"type":"function","function":{"name":"lookup_weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],"tool_choice":"required","response_format":{"type":"json_schema","json_schema":{"name":"weather_response","schema":{"type":"object","properties":{"temperature":{"type":"number"}}}}}}`)
+	if err := json.Unmarshal(body, &req); err != nil {
+		t.Fatal(err)
+	}
+
+	provider := NewGeminiProvider("gemini:test", server.URL+"/v1beta/openai", "test-key", []app.Model{{ID: "gemini:test:models/gemini-2.5-flash"}})
+	response, err := provider.ChatCompletions(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Completion == nil {
+		t.Fatalf("expected typed completion response")
+	}
+	if response.AssistantText() != "ok" {
+		t.Fatalf("unexpected response content: %s", response.AssistantText())
+	}
+
+	toolsValue, ok := captured["tools"].([]any)
+	if !ok || len(toolsValue) != 1 {
+		t.Fatalf("expected one translated Gemini tool, got %+v", captured["tools"])
+	}
+	toolConfig, ok := captured["toolConfig"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected translated toolConfig, got %+v", captured["toolConfig"])
+	}
+	functionCallingConfig, ok := toolConfig["functionCallingConfig"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected functionCallingConfig, got %+v", toolConfig)
+	}
+	mode, _ := functionCallingConfig["mode"].(string)
+	if mode != "ANY" {
+		t.Fatalf("expected tool_choice required to map to ANY mode, got %q", mode)
+	}
+	generationConfig, ok := captured["generationConfig"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected generationConfig, got %+v", captured["generationConfig"])
+	}
+	mimeType, _ := generationConfig["responseMimeType"].(string)
+	if mimeType != "application/json" {
+		t.Fatalf("expected response format json_schema to request JSON mime type, got %q", mimeType)
+	}
+	if _, exists := generationConfig["responseJsonSchema"]; !exists {
+		t.Fatalf("expected responseJsonSchema in generationConfig, got %+v", generationConfig)
+	}
+}
+
+func TestGeminiProviderNormalizesUnsupportedMessageRoles(t *testing.T) {
+	var captured map[string]any
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1beta/models/gemini-2.5-flash:generateContent", func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read request body: %v", err)
+		}
+		if err := json.Unmarshal(bodyBytes, &captured); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"candidates": []map[string]any{{
+				"content": map[string]any{"parts": []map[string]any{{"text": "ok"}}},
+			}},
+		})
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	var req app.ChatRequest
+	body := []byte(`{"model":"gemini:test:models/gemini-2.5-flash","messages":[{"role":"system","content":"system instruction"},{"role":"assistant","content":"calling tool"},{"role":"tool","tool_call_id":"call_42","content":"{\"temperature\":18}"},{"role":"developer","content":"developer note"},{"role":"user","content":"final user turn"}]}`)
+	if err := json.Unmarshal(body, &req); err != nil {
+		t.Fatal(err)
+	}
+
+	provider := NewGeminiProvider("gemini:test", server.URL+"/v1beta/openai", "test-key", []app.Model{{ID: "gemini:test:models/gemini-2.5-flash"}})
+	if _, err := provider.ChatCompletions(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+
+	contents, ok := captured["contents"].([]any)
+	if !ok || len(contents) == 0 {
+		t.Fatalf("expected contents in Gemini request, got %+v", captured)
+	}
+	roles := make([]string, 0, len(contents))
+	foundToolMarker := false
+	for _, entry := range contents {
+		contentEntry, ok := entry.(map[string]any)
+		if !ok {
+			t.Fatalf("unexpected content entry type: %+v", entry)
+		}
+		role, _ := contentEntry["role"].(string)
+		roles = append(roles, role)
+		if role == "tool" || role == "system" || role == "developer" {
+			t.Fatalf("found unsupported role %q in translated Gemini contents: %+v", role, contents)
+		}
+		parts, _ := contentEntry["parts"].([]any)
+		for _, part := range parts {
+			partMap, _ := part.(map[string]any)
+			text, _ := partMap["text"].(string)
+			if strings.Contains(text, "[tool_result tool_call_id=call_42]") {
+				foundToolMarker = true
+			}
+		}
+	}
+
+	if !foundToolMarker {
+		t.Fatalf("expected tool message marker with tool_call_id in Gemini request contents, got %+v", contents)
+	}
+	if !strings.Contains(strings.Join(roles, ","), "model") {
+		t.Fatalf("expected assistant role to map to model, got roles %v", roles)
 	}
 }

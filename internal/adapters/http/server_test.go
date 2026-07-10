@@ -355,7 +355,7 @@ func (p *streamingMockProvider) Models(_ context.Context) ([]app.Model, error) {
 }
 
 func (p *streamingMockProvider) ChatCompletions(_ context.Context, req app.ChatRequest) (app.ChatResponse, error) {
-	return app.ChatResponse{Model: req.Model, Content: "non-stream"}, nil
+	return app.ChatResponse{Model: req.Model, Completion: app.NewTextCompletion(req.Model, "non-stream")}, nil
 }
 
 func (p *streamingMockProvider) CanHandle(modelID string) bool {
@@ -434,8 +434,28 @@ func (p *passthroughMockProvider) ChatCompletions(_ context.Context, req app.Cha
 	p.calls++
 	p.lastRequest = req
 	return app.ChatResponse{
-		Model:   req.Model,
-		RawJSON: []byte(`{"id":"chatcmpl-1","object":"chat.completion","model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"hello","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`),
+		Model: req.Model,
+		Completion: &app.OpenAIChatCompletionResponse{
+			ID:      "chatcmpl-1",
+			Object:  "chat.completion",
+			Created: 1,
+			Model:   req.Model,
+			Choices: []app.OpenAIChatChoice{{
+				Index: 0,
+				Message: app.OpenAIChatMessage{
+					Role: "assistant",
+					ToolCalls: []app.OpenAIChatToolCall{{
+						ID:   "call_1",
+						Type: "function",
+						Function: app.OpenAIChatToolFunction{
+							Name:      "hello",
+							Arguments: "{}",
+						},
+					}},
+				},
+				FinishReason: "tool_calls",
+			}},
+		},
 	}, nil
 }
 

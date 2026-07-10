@@ -26,7 +26,14 @@ func TestStaticCatalogAndAutoRouting(t *testing.T) {
 		t.Fatalf("expected catalog to contain provider model")
 	}
 	models := catalog.Models()
-	if len(models) < 2 || models[1].ContextLimit == nil || *models[1].ContextLimit != 128000 {
+	var providerModel *Model
+	for index := range models {
+		if models[index].ID == "openai:openai:gpt-4o-mini" {
+			providerModel = &models[index]
+			break
+		}
+	}
+	if providerModel == nil || providerModel.ContextLimit == nil || *providerModel.ContextLimit != 128000 {
 		t.Fatalf("expected model context limit in catalog")
 	}
 	router := NewRouter(cfg, catalog)
@@ -163,11 +170,20 @@ func TestListModelsIsUniqueAndIncludesAuto(t *testing.T) {
 	router := NewRouter(cfg, NewStaticCatalog(cfg), mock)
 
 	models := router.ListModels()
-	if len(models) != 2 {
-		t.Fatalf("expected auto + one unique model, got %+v", models)
+	if len(models) < 2 {
+		t.Fatalf("expected auto aliases plus provider model, got %+v", models)
 	}
 	if models[0].ID != "auto" {
 		t.Fatalf("expected auto model to be present and first, got %+v", models)
+	}
+	providerModelCount := 0
+	for _, model := range models {
+		if model.ID == "openai:openai:gpt-4o-mini" {
+			providerModelCount++
+		}
+	}
+	if providerModelCount != 1 {
+		t.Fatalf("expected one provider model entry, got %+v", models)
 	}
 }
 
