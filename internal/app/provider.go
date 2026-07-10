@@ -343,6 +343,7 @@ type OpenAIChatToolFunction struct {
 }
 
 type OpenAIChatToolCall struct {
+	Index    *int                   `json:"index,omitempty"`
 	ID       string                 `json:"id,omitempty"`
 	Type     string                 `json:"type,omitempty"`
 	Function OpenAIChatToolFunction `json:"function"`

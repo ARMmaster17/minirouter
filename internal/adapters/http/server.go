@@ -430,6 +430,28 @@ func (s *Server) handleChatCompletionsStream(w http.ResponseWriter, r *http.Requ
 			}
 			created := time.Now().Unix()
 			id := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
+			assistantText := outcome.response.AssistantText()
+			toolCalls := []app.OpenAIChatToolCall{}
+			finishReason := "stop"
+			if outcome.response.Completion != nil && len(outcome.response.Completion.Choices) > 0 {
+				choice := outcome.response.Completion.Choices[0]
+				if len(choice.Message.ToolCalls) > 0 {
+					toolCalls = make([]app.OpenAIChatToolCall, 0, len(choice.Message.ToolCalls))
+					for i, toolCall := range choice.Message.ToolCalls {
+						if toolCall.Index == nil {
+							idx := i
+							toolCall.Index = &idx
+						}
+						toolCalls = append(toolCalls, toolCall)
+					}
+				}
+				if strings.TrimSpace(choice.FinishReason) != "" {
+					finishReason = choice.FinishReason
+				}
+			}
+			if len(toolCalls) > 0 {
+				finishReason = "tool_calls"
+			}
 
 			roleChunk := app.OpenAIChatCompletionChunk{
 				ID:      id,
@@ -442,16 +464,35 @@ func (s *Server) handleChatCompletionsStream(w http.ResponseWriter, r *http.Requ
 					FinishReason: nil,
 				}},
 			}
-			contentChunk := app.OpenAIChatCompletionChunk{
-				ID:      id,
-				Object:  "chat.completion.chunk",
-				Created: created,
-				Model:   responseModel,
-				Choices: []app.OpenAIChatChunkChoice{{
-					Index:        0,
-					Delta:        app.OpenAIChatDelta{Content: outcome.response.AssistantText()},
-					FinishReason: nil,
-				}},
+			contentChunk := app.OpenAIChatCompletionChunk{}
+			hasContentChunk := strings.TrimSpace(assistantText) != ""
+			if hasContentChunk {
+				contentChunk = app.OpenAIChatCompletionChunk{
+					ID:      id,
+					Object:  "chat.completion.chunk",
+					Created: created,
+					Model:   responseModel,
+					Choices: []app.OpenAIChatChunkChoice{{
+						Index:        0,
+						Delta:        app.OpenAIChatDelta{Content: assistantText},
+						FinishReason: nil,
+					}},
+				}
+			}
+			toolCallsChunk := app.OpenAIChatCompletionChunk{}
+			hasToolCallsChunk := len(toolCalls) > 0
+			if hasToolCallsChunk {
+				toolCallsChunk = app.OpenAIChatCompletionChunk{
+					ID:      id,
+					Object:  "chat.completion.chunk",
+					Created: created,
+					Model:   responseModel,
+					Choices: []app.OpenAIChatChunkChoice{{
+						Index:        0,
+						Delta:        app.OpenAIChatDelta{ToolCalls: toolCalls},
+						FinishReason: nil,
+					}},
+				}
 			}
 			stopChunk := app.OpenAIChatCompletionChunk{
 				ID:      id,
@@ -461,26 +502,36 @@ func (s *Server) handleChatCompletionsStream(w http.ResponseWriter, r *http.Requ
 				Choices: []app.OpenAIChatChunkChoice{{
 					Index:        0,
 					Delta:        app.OpenAIChatDelta{},
-					FinishReason: "stop",
+					FinishReason: finishReason,
 				}},
 			}
 
 			encodedRole, _ := json.Marshal(roleChunk)
 			encodedContent, _ := json.Marshal(contentChunk)
+			encodedToolCalls, _ := json.Marshal(toolCallsChunk)
 			encodedStop, _ := json.Marshal(stopChunk)
 			roleChunkText := fmt.Sprintf("data: %s\n\n", encodedRole)
-			contentChunkText := fmt.Sprintf("data: %s\n\n", encodedContent)
+			contentChunkText := ""
+			if hasContentChunk {
+				contentChunkText = fmt.Sprintf("data: %s\n\n", encodedContent)
+			}
+			toolCallsChunkText := ""
+			if hasToolCallsChunk {
+				toolCallsChunkText = fmt.Sprintf("data: %s\n\n", encodedToolCalls)
+			}
 			stopChunkText := fmt.Sprintf("data: %s\n\n", encodedStop)
 			doneChunk := "data: [DONE]\n\n"
 			responseBuffer.WriteString(roleChunkText)
 			responseBuffer.WriteString(contentChunkText)
+			responseBuffer.WriteString(toolCallsChunkText)
 			responseBuffer.WriteString(stopChunkText)
 			responseBuffer.WriteString(doneChunk)
 			n1, _ := fmt.Fprint(w, roleChunkText)
 			n2, _ := fmt.Fprint(w, contentChunkText)
-			n3, _ := fmt.Fprint(w, stopChunkText)
-			n4, _ := fmt.Fprint(w, doneChunk)
-			written += n1 + n2 + n3 + n4
+			n3, _ := fmt.Fprint(w, toolCallsChunkText)
+			n4, _ := fmt.Fprint(w, stopChunkText)
+			n5, _ := fmt.Fprint(w, doneChunk)
+			written += n1 + n2 + n3 + n4 + n5
 			flusher.Flush()
 
 			s.debugPayload("request", bodyBytes)

@@ -315,6 +315,88 @@ func TestChatCompletionsUsesProviderSSEPassthroughWhenSupported(t *testing.T) {
 	}
 }
 
+func TestChatCompletionsFallbackStreamEmitsToolCallsWithIndexAndFinishReason(t *testing.T) {
+	cfg := config.Default()
+	cfg.Providers = []config.ProviderConfig{{Kind: "openai", Name: "openai", Enabled: true, Models: []config.ModelConfig{{ID: "gpt-4o-mini"}}}}
+	cfg.Routing.Tiers[domain.TierSimple] = domain.TierConfig{Models: []string{"openai:openai:gpt-4o-mini"}}
+	provider := &passthroughMockProvider{}
+	server := New(app.NewRouter(cfg, app.NewStaticCatalog(cfg), provider))
+
+	body := []byte(`{"model":"auto","messages":[{"role":"user","content":"hello"}],"stream":true}`)
+	chatReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	chatRec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(chatRec, chatReq)
+
+	if chatRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for fallback stream chat, got %d body=%s", chatRec.Code, chatRec.Body.String())
+	}
+	if !strings.HasPrefix(chatRec.Header().Get("Content-Type"), "text/event-stream") {
+		t.Fatalf("expected event-stream content type, got %s", chatRec.Header().Get("Content-Type"))
+	}
+
+	bodyText := chatRec.Body.String()
+	lines := strings.Split(bodyText, "\n")
+	dataLines := make([]string, 0)
+	for _, line := range lines {
+		if strings.HasPrefix(line, "data: ") {
+			dataLines = append(dataLines, strings.TrimPrefix(line, "data: "))
+		}
+	}
+	if len(dataLines) < 4 {
+		t.Fatalf("expected at least 4 data lines, got %d body=%s", len(dataLines), bodyText)
+	}
+
+	if dataLines[len(dataLines)-1] != "[DONE]" {
+		t.Fatalf("expected done marker as last data line, got %q", dataLines[len(dataLines)-1])
+	}
+
+	toolChunkIndex := -1
+	finishChunkIndex := -1
+	for i, payload := range dataLines {
+		if payload == "[DONE]" {
+			continue
+		}
+		var chunk app.OpenAIChatCompletionChunk
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			t.Fatalf("decode chunk %d: %v payload=%s", i, err, payload)
+		}
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+		choice := chunk.Choices[0]
+		if len(choice.Delta.ToolCalls) > 0 {
+			toolChunkIndex = i
+			if len(choice.Delta.ToolCalls) != 1 {
+				t.Fatalf("expected single tool call in delta, got %+v", choice.Delta.ToolCalls)
+			}
+			toolCall := choice.Delta.ToolCalls[0]
+			if toolCall.Index == nil || *toolCall.Index != 0 {
+				t.Fatalf("expected tool call index 0, got %+v", toolCall.Index)
+			}
+		}
+		if reason, ok := choice.FinishReason.(string); ok && strings.TrimSpace(reason) != "" {
+			finishChunkIndex = i
+			if reason != "tool_calls" {
+				t.Fatalf("expected finish_reason tool_calls, got %q", reason)
+			}
+		}
+	}
+
+	if toolChunkIndex == -1 {
+		t.Fatalf("expected tool-call delta chunk in stream, body=%s", bodyText)
+	}
+	if finishChunkIndex == -1 {
+		t.Fatalf("expected terminal finish chunk in stream, body=%s", bodyText)
+	}
+	if toolChunkIndex > finishChunkIndex {
+		t.Fatalf("expected tool-call chunk before finish chunk, tool=%d finish=%d", toolChunkIndex, finishChunkIndex)
+	}
+	doneIndex := len(dataLines) - 1
+	if finishChunkIndex > doneIndex {
+		t.Fatalf("expected finish chunk before done marker, finish=%d done=%d", finishChunkIndex, doneIndex)
+	}
+}
+
 func TestChatCompletionsAcceptsArrayContentAndPreservesRawResponse(t *testing.T) {
 	cfg := config.Default()
 	cfg.Providers = []config.ProviderConfig{{Kind: "openai", Name: "openai", Enabled: true, Models: []config.ModelConfig{{ID: "gpt-4o-mini"}}}}

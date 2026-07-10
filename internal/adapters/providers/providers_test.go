@@ -3,6 +3,7 @@ package providers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -447,5 +448,80 @@ func TestGeminiProviderNormalizesUnsupportedMessageRoles(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(roles, ","), "model") {
 		t.Fatalf("expected assistant role to map to model, got roles %v", roles)
+	}
+}
+
+func TestGeminiProviderStreamingToolCallSchemaIncludesIndexAndFinishReason(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1beta/models/gemini-2.5-flash:streamGenerateContent", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"id\":\"call_1\",\"name\":\"lookup_weather\",\"args\":{\"city\":\"London\"}}}]},\"finishReason\":\"MALFORMED_FUNCTION_CALL\"}]}\n\n")
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	provider := NewGeminiProvider("gemini:test", server.URL+"/v1beta/openai", "test-key", []app.Model{{ID: "gemini:test:models/gemini-2.5-flash"}})
+	streamResp, err := provider.ChatCompletionsStream(context.Background(), app.ChatRequest{Model: "gemini:test:models/gemini-2.5-flash", Messages: []app.ChatMessage{{Role: "user", Content: app.ChatMessageContent{Text: "hello"}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer streamResp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(streamResp.Body)
+	if err != nil {
+		t.Fatalf("read stream body: %v", err)
+	}
+
+	dataLines := make([]string, 0)
+	for _, line := range strings.Split(string(bodyBytes), "\n") {
+		if strings.HasPrefix(line, "data: ") {
+			dataLines = append(dataLines, strings.TrimPrefix(line, "data: "))
+		}
+	}
+	if len(dataLines) < 3 {
+		t.Fatalf("expected role/tool/finish chunks and done marker, got lines=%d body=%s", len(dataLines), string(bodyBytes))
+	}
+	if dataLines[len(dataLines)-1] != "[DONE]" {
+		t.Fatalf("expected [DONE] last, got %q", dataLines[len(dataLines)-1])
+	}
+
+	toolChunkFound := false
+	finishChunkFound := false
+	for _, payload := range dataLines {
+		if payload == "[DONE]" {
+			continue
+		}
+		var chunk app.OpenAIChatCompletionChunk
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			t.Fatalf("decode streamed chunk: %v payload=%s", err, payload)
+		}
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+		choice := chunk.Choices[0]
+		if len(choice.Delta.ToolCalls) > 0 {
+			toolChunkFound = true
+			for i, toolCall := range choice.Delta.ToolCalls {
+				if toolCall.Index == nil {
+					t.Fatalf("expected tool call index for tool %d", i)
+				}
+				if *toolCall.Index != i {
+					t.Fatalf("expected tool call index %d, got %d", i, *toolCall.Index)
+				}
+			}
+		}
+		if reason, ok := choice.FinishReason.(string); ok && strings.TrimSpace(reason) != "" {
+			if reason != "tool_calls" {
+				t.Fatalf("expected finish reason tool_calls, got %q", reason)
+			}
+			finishChunkFound = true
+		}
+	}
+
+	if !toolChunkFound {
+		t.Fatalf("expected streamed tool-call chunk, body=%s", string(bodyBytes))
+	}
+	if !finishChunkFound {
+		t.Fatalf("expected streamed finish chunk, body=%s", string(bodyBytes))
 	}
 }

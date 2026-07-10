@@ -197,6 +197,7 @@ func (p *GeminiProvider) ChatCompletionsStream(ctx context.Context, req app.Chat
 			}
 			delta := app.OpenAIChatDelta{}
 			parts := []app.OpenAIChatToolCall{}
+			toolCallIndex := 0
 			for _, part := range candidate.Content.Parts {
 				if part == nil {
 					continue
@@ -219,7 +220,9 @@ func (p *GeminiProvider) ChatCompletionsStream(ctx context.Context, req app.Chat
 				}
 				if part.FunctionCall != nil {
 					arguments, _ := json.Marshal(part.FunctionCall.Args)
+					idx := toolCallIndex
 					parts = append(parts, app.OpenAIChatToolCall{
+						Index: &idx,
 						ID:   part.FunctionCall.ID,
 						Type: "function",
 						Function: app.OpenAIChatToolFunction{
@@ -227,6 +230,7 @@ func (p *GeminiProvider) ChatCompletionsStream(ctx context.Context, req app.Chat
 							Arguments: string(arguments),
 						},
 					})
+					toolCallIndex++
 				}
 			}
 			if len(parts) > 0 {
@@ -497,6 +501,7 @@ func geminiResponseToOpenAI(model string, response *genai.GenerateContentRespons
 		if candidate.Content != nil {
 			partsText := make([]string, 0)
 			toolCalls := make([]app.OpenAIChatToolCall, 0)
+			toolCallIndex := 0
 			for _, part := range candidate.Content.Parts {
 				if part == nil {
 					continue
@@ -506,7 +511,9 @@ func geminiResponseToOpenAI(model string, response *genai.GenerateContentRespons
 				}
 				if part.FunctionCall != nil {
 					arguments, _ := json.Marshal(part.FunctionCall.Args)
+					idx := toolCallIndex
 					toolCall := app.OpenAIChatToolCall{
+						Index: &idx,
 						ID:   part.FunctionCall.ID,
 						Type: "function",
 						Function: app.OpenAIChatToolFunction{
@@ -515,6 +522,7 @@ func geminiResponseToOpenAI(model string, response *genai.GenerateContentRespons
 						},
 					}
 					toolCalls = append(toolCalls, toolCall)
+					toolCallIndex++
 				}
 			}
 			if len(partsText) > 0 {
