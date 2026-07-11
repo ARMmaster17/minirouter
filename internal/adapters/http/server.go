@@ -551,21 +551,7 @@ func (s *Server) tryProxyProviderStream(w http.ResponseWriter, r *http.Request, 
 
 	estimatedTokens := estimateInputTokens(req)
 	req.EstimatedInputTokens = &estimatedTokens
-	resolvedModel, result, err := s.router.ResolveModel(req.Model, req.Prompt, estimatedTokens)
-	if err != nil {
-		return false
-	}
-	provider, err := s.router.Providers.Resolve(resolvedModel)
-	if err != nil {
-		return false
-	}
-	streamingProvider, ok := provider.(app.StreamingProvider)
-	if !ok {
-		return false
-	}
-
-	req.Model = resolvedModel
-	streamResponse, err := streamingProvider.ChatCompletionsStream(r.Context(), req)
+	streamResponse, result, err := s.router.ChatStream(r.Context(), req)
 	if err != nil {
 		return false
 	}
@@ -588,7 +574,7 @@ func (s *Server) tryProxyProviderStream(w http.ResponseWriter, r *http.Request, 
 
 	resolvedForLog := streamResponse.Model
 	if strings.TrimSpace(resolvedForLog) == "" {
-		resolvedForLog = resolvedModel
+		resolvedForLog = requestedModel
 	}
 
 	written := 0

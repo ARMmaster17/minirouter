@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"html"
 	"io"
 	"net/http"
@@ -315,6 +316,66 @@ func TestChatCompletionsUsesProviderSSEPassthroughWhenSupported(t *testing.T) {
 	}
 }
 
+func TestChatCompletionsStreamFailsOverOnFirstChunkErrorEvent(t *testing.T) {
+	cfg := config.Default()
+	cfg.Routing.Tiers[domain.TierSimple] = domain.TierConfig{Models: []string{"stream:startup:bad", "stream:startup:good"}}
+	provider := &startupFailoverStreamingProvider{}
+	server := New(app.NewRouter(cfg, app.NewStaticCatalog(cfg), provider))
+
+	body := map[string]any{"model": "auto", "prompt": "simple request", "stream": true}
+	encoded, _ := json.Marshal(body)
+	chatReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(encoded))
+	chatRec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(chatRec, chatReq)
+
+	if chatRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for stream failover chat, got %d body=%s", chatRec.Code, chatRec.Body.String())
+	}
+	bodyText := chatRec.Body.String()
+	if strings.Contains(bodyText, "startup failed") {
+		t.Fatalf("expected startup error event to be hidden by failover, body=%s", bodyText)
+	}
+	if !strings.Contains(bodyText, "good-stream") {
+		t.Fatalf("expected fallback stream content, body=%s", bodyText)
+	}
+	if provider.calls["stream:startup:bad"] != 1 {
+		t.Fatalf("expected bad model called once, got %+v", provider.calls)
+	}
+	if provider.calls["stream:startup:good"] != 1 {
+		t.Fatalf("expected good model called once, got %+v", provider.calls)
+	}
+}
+
+func TestChatCompletionsStreamDoesNotFailOverAfterCommit(t *testing.T) {
+	cfg := config.Default()
+	cfg.Routing.Tiers[domain.TierSimple] = domain.TierConfig{Models: []string{"stream:post:bad", "stream:post:good"}}
+	provider := &postCommitFailingStreamingProvider{}
+	server := New(app.NewRouter(cfg, app.NewStaticCatalog(cfg), provider))
+
+	body := map[string]any{"model": "auto", "prompt": "simple request", "stream": true}
+	encoded, _ := json.Marshal(body)
+	chatReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(encoded))
+	chatRec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(chatRec, chatReq)
+
+	if chatRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for post-commit failure stream chat, got %d body=%s", chatRec.Code, chatRec.Body.String())
+	}
+	bodyText := chatRec.Body.String()
+	if !strings.Contains(bodyText, "first") {
+		t.Fatalf("expected first committed chunk in stream body, body=%s", bodyText)
+	}
+	if strings.Contains(bodyText, "good-stream") {
+		t.Fatalf("did not expect fallback provider stream after commit, body=%s", bodyText)
+	}
+	if provider.calls["stream:post:bad"] != 1 {
+		t.Fatalf("expected bad model called once, got %+v", provider.calls)
+	}
+	if provider.calls["stream:post:good"] != 0 {
+		t.Fatalf("expected good model never called post-commit, got %+v", provider.calls)
+	}
+}
+
 func TestChatCompletionsFallbackStreamEmitsToolCallsWithIndexAndFinishReason(t *testing.T) {
 	cfg := config.Default()
 	cfg.Providers = []config.ProviderConfig{{Kind: "openai", Name: "openai", Enabled: true, Models: []config.ModelConfig{{ID: "gpt-4o-mini"}}}}
@@ -544,3 +605,90 @@ func (p *passthroughMockProvider) ChatCompletions(_ context.Context, req app.Cha
 func (p *passthroughMockProvider) CanHandle(modelID string) bool {
 	return strings.HasPrefix(modelID, "openai:openai:")
 }
+
+type startupFailoverStreamingProvider struct {
+	calls map[string]int
+}
+
+func (p *startupFailoverStreamingProvider) ID() string { return "stream:startup" }
+
+func (p *startupFailoverStreamingProvider) Models(_ context.Context) ([]app.Model, error) {
+	return []app.Model{
+		{ID: "stream:startup:bad", Object: "model", OwnedBy: "stream:startup", Provider: "stream:startup"},
+		{ID: "stream:startup:good", Object: "model", OwnedBy: "stream:startup", Provider: "stream:startup"},
+	}, nil
+}
+
+func (p *startupFailoverStreamingProvider) ChatCompletions(_ context.Context, req app.ChatRequest) (app.ChatResponse, error) {
+	return app.ChatResponse{Model: req.Model, Completion: app.NewTextCompletion(req.Model, "non-stream")}, nil
+}
+
+func (p *startupFailoverStreamingProvider) CanHandle(modelID string) bool {
+	return strings.HasPrefix(modelID, "stream:startup:")
+}
+
+func (p *startupFailoverStreamingProvider) ChatCompletionsStream(_ context.Context, req app.ChatRequest) (app.ChatStreamResponse, error) {
+	if p.calls == nil {
+		p.calls = map[string]int{}
+	}
+	p.calls[req.Model]++
+	if strings.HasSuffix(req.Model, ":bad") {
+		body := "data: {\"error\":{\"message\":\"startup failed\",\"type\":\"invalid_request_error\"}}\n\ndata: [DONE]\n\n"
+		return app.ChatStreamResponse{Body: io.NopCloser(strings.NewReader(body)), ContentType: "text/event-stream", Model: req.Model}, nil
+	}
+	body := "data: {\"id\":\"upstream-good\",\"choices\":[{\"delta\":{\"content\":\"good-stream\"}}]}\n\ndata: [DONE]\n\n"
+	return app.ChatStreamResponse{Body: io.NopCloser(strings.NewReader(body)), ContentType: "text/event-stream", Model: req.Model}, nil
+}
+
+type postCommitFailingStreamingProvider struct {
+	calls map[string]int
+}
+
+func (p *postCommitFailingStreamingProvider) ID() string { return "stream:post" }
+
+func (p *postCommitFailingStreamingProvider) Models(_ context.Context) ([]app.Model, error) {
+	return []app.Model{
+		{ID: "stream:post:bad", Object: "model", OwnedBy: "stream:post", Provider: "stream:post"},
+		{ID: "stream:post:good", Object: "model", OwnedBy: "stream:post", Provider: "stream:post"},
+	}, nil
+}
+
+func (p *postCommitFailingStreamingProvider) ChatCompletions(_ context.Context, req app.ChatRequest) (app.ChatResponse, error) {
+	return app.ChatResponse{Model: req.Model, Completion: app.NewTextCompletion(req.Model, "non-stream")}, nil
+}
+
+func (p *postCommitFailingStreamingProvider) CanHandle(modelID string) bool {
+	return strings.HasPrefix(modelID, "stream:post:")
+}
+
+func (p *postCommitFailingStreamingProvider) ChatCompletionsStream(_ context.Context, req app.ChatRequest) (app.ChatStreamResponse, error) {
+	if p.calls == nil {
+		p.calls = map[string]int{}
+	}
+	p.calls[req.Model]++
+	if strings.HasSuffix(req.Model, ":bad") {
+		return app.ChatStreamResponse{
+			Body:        &failingStreamBody{payload: []byte("data: {\"id\":\"upstream-bad\",\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n")},
+			ContentType: "text/event-stream",
+			Model:       req.Model,
+		}, nil
+	}
+	body := "data: {\"id\":\"upstream-good\",\"choices\":[{\"delta\":{\"content\":\"good-stream\"}}]}\n\ndata: [DONE]\n\n"
+	return app.ChatStreamResponse{Body: io.NopCloser(strings.NewReader(body)), ContentType: "text/event-stream", Model: req.Model}, nil
+}
+
+type failingStreamBody struct {
+	payload []byte
+	sent    bool
+}
+
+func (b *failingStreamBody) Read(p []byte) (int, error) {
+	if !b.sent {
+		b.sent = true
+		n := copy(p, b.payload)
+		return n, nil
+	}
+	return 0, errors.New("upstream read failed")
+}
+
+func (b *failingStreamBody) Close() error { return nil }

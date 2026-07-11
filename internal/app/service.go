@@ -1,9 +1,13 @@
 package app
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 	"time"
@@ -250,6 +254,30 @@ func (r *Router) Chat(ctx context.Context, req ChatRequest) (ChatResponse, domai
 	return response, result, nil
 }
 
+func (r *Router) ChatStream(ctx context.Context, req ChatRequest) (ChatStreamResponse, domain.ScoringResult, error) {
+	estimatedInputTokens := len(req.Prompt)/4 + 1
+	if req.EstimatedInputTokens != nil && *req.EstimatedInputTokens > 0 {
+		estimatedInputTokens = *req.EstimatedInputTokens
+	}
+	resolvedModel, result, err := r.ResolveModel(req.Model, req.Prompt, estimatedInputTokens)
+	if err != nil {
+		return ChatStreamResponse{}, result, err
+	}
+	req.Model = resolvedModel
+	if r.Providers == nil {
+		return ChatStreamResponse{}, result, errors.New("no provider registry configured")
+	}
+	startTier := r.resolveRequestTier(resolvedModel, result, estimatedInputTokens)
+	response, err := r.chatStreamWithTierFallbacks(ctx, req, startTier, estimatedInputTokens, map[domain.Tier]struct{}{}, map[string]struct{}{})
+	if err != nil {
+		return ChatStreamResponse{}, result, err
+	}
+	if strings.TrimSpace(response.Model) == "" {
+		response.Model = req.Model
+	}
+	return response, result, nil
+}
+
 func (r *Router) failurePolicyForError(err error) domain.FailurePolicy {
 	policy := r.Config.Routing.Failures.Default
 	if err == nil {
@@ -439,6 +467,258 @@ func (r *Router) chatModelWithPolicy(ctx context.Context, req ChatRequest) (Chat
 		lastErr = fmt.Errorf("chat request failed")
 	}
 	return ChatResponse{}, policy, lastErr
+}
+
+func (r *Router) chatStreamWithTierFallbacks(ctx context.Context, req ChatRequest, tier domain.Tier, estimatedInputTokens int, visited map[domain.Tier]struct{}, failedModels map[string]struct{}) (ChatStreamResponse, error) {
+	if tier == "" {
+		if _, failed := failedModels[req.Model]; failed {
+			return ChatStreamResponse{}, fmt.Errorf("chat stream request failed: model %s already failed", req.Model)
+		}
+		response, _, err := r.chatStreamModelWithPolicy(ctx, req)
+		if err != nil {
+			failedModels[req.Model] = struct{}{}
+		}
+		return response, err
+	}
+	if _, seen := visited[tier]; seen {
+		return ChatStreamResponse{}, fmt.Errorf("tier traversal cycle detected at %s", tier)
+	}
+	visited[tier] = struct{}{}
+
+	candidates := r.rankModelsForTier(tier, estimatedInputTokens)
+	if len(candidates) == 0 {
+		return ChatStreamResponse{}, fmt.Errorf("no routable models in tier %s", tier)
+	}
+	if req.Model != "" {
+		candidates = prioritizeModel(candidates, req.Model)
+	}
+	orderedCandidates, evaluations, skipped := r.rankModelsForTierWithDetails(tier, estimatedInputTokens)
+	if req.Model != "" {
+		orderedCandidates = prioritizeModel(orderedCandidates, req.Model)
+	}
+	r.debugRouting("stream_tier_candidates", map[string]any{
+		"tier":                 tier,
+		"estimatedInputTokens": estimatedInputTokens,
+		"requestedModel":       req.Model,
+		"orderedCandidates":    orderedCandidates,
+		"evaluations":          evaluations,
+		"skipped":              skipped,
+	})
+
+	lastPolicy := r.failurePolicyForError(nil)
+	var lastErr error
+	attemptedAny := false
+	for _, candidate := range candidates {
+		if _, failed := failedModels[candidate]; failed {
+			continue
+		}
+		attemptedAny = true
+		attemptReq := req
+		attemptReq.Model = candidate
+		r.debugRouting("stream_attempt", map[string]any{
+			"tier":       tier,
+			"model":      candidate,
+			"attemptReq": map[string]any{"stream": attemptReq.Stream, "messages": len(attemptReq.Messages)},
+		})
+		response, policy, err := r.chatStreamModelWithPolicy(ctx, attemptReq)
+		if err == nil {
+			r.debugRouting("stream_attempt_result", map[string]any{
+				"tier":   tier,
+				"model":  candidate,
+				"result": "success",
+			})
+			return response, nil
+		}
+		failedModels[candidate] = struct{}{}
+		lastErr = err
+		lastPolicy = policy
+		r.debugRouting("stream_attempt_result", map[string]any{
+			"tier":          tier,
+			"model":         candidate,
+			"result":        "failure",
+			"error":         err.Error(),
+			"failurePolicy": policy,
+		})
+		if !failurePolicyTierNext(policy) {
+			break
+		}
+	}
+
+	if lastErr == nil {
+		if !attemptedAny {
+			lastErr = fmt.Errorf("no remaining unfailed models in tier %s", tier)
+		} else {
+			lastErr = fmt.Errorf("chat stream request failed")
+		}
+	}
+	switch normalizeTierSwitch(lastPolicy.TierSwitch) {
+	case domain.TierSwitchUp, domain.TierSwitchDown:
+		nextTier, ok := adjacentTier(tier, normalizeTierSwitch(lastPolicy.TierSwitch))
+		if !ok {
+			return ChatStreamResponse{}, lastErr
+		}
+		r.debugRouting("stream_tier_fallback", map[string]any{
+			"fromTier":      tier,
+			"toTier":        nextTier,
+			"error":         lastErr.Error(),
+			"failurePolicy": lastPolicy,
+		})
+		nextReq := req
+		nextReq.Model = ""
+		return r.chatStreamWithTierFallbacks(ctx, nextReq, nextTier, estimatedInputTokens, visited, failedModels)
+	default:
+		return ChatStreamResponse{}, lastErr
+	}
+}
+
+func (r *Router) chatStreamModelWithPolicy(ctx context.Context, req ChatRequest) (ChatStreamResponse, domain.FailurePolicy, error) {
+	policy := r.failurePolicyForError(nil)
+	attempts := policy.Retry + 1
+	if attempts <= 0 {
+		attempts = 1
+	}
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		provider, err := r.Providers.Resolve(req.Model)
+		if err != nil {
+			lastErr = err
+			break
+		}
+		streamingProvider, ok := provider.(StreamingProvider)
+		if !ok {
+			lastErr = fmt.Errorf("model %s does not support streaming", req.Model)
+			policy = r.failurePolicyForError(lastErr)
+			break
+		}
+		response, err := streamingProvider.ChatCompletionsStream(ctx, req)
+		if err == nil {
+			probed, probeErr := probeStreamStartup(response)
+			if probeErr == nil {
+				if strings.TrimSpace(probed.Model) == "" {
+					probed.Model = req.Model
+				}
+				return probed, policy, nil
+			}
+			err = probeErr
+		}
+		lastErr = err
+		policy = r.failurePolicyForError(err)
+		attempts = policy.Retry + 1
+		if attempts <= 0 {
+			attempts = 1
+		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("chat stream request failed")
+	}
+	return ChatStreamResponse{}, policy, lastErr
+}
+
+func probeStreamStartup(response ChatStreamResponse) (ChatStreamResponse, error) {
+	if response.Body == nil {
+		return ChatStreamResponse{}, errors.New("upstream stream missing body")
+	}
+	reader := bufio.NewReader(response.Body)
+	var captured bytes.Buffer
+	eventLines := make([]string, 0)
+	for {
+		line, readErr := reader.ReadString('\n')
+		if line != "" {
+			captured.WriteString(line)
+			trimmed := strings.TrimRight(line, "\r\n")
+			if trimmed == "" {
+				decision, decisionErr := classifyStartupSSEEvent(eventLines)
+				if decisionErr != nil {
+					_ = response.Body.Close()
+					return ChatStreamResponse{}, decisionErr
+				}
+				if decision == startupEventAccept {
+					response.Body = &prefixedReadCloser{
+						Reader: io.MultiReader(bytes.NewReader(captured.Bytes()), reader),
+						Closer: response.Body,
+					}
+					return response, nil
+				}
+				eventLines = eventLines[:0]
+			} else {
+				eventLines = append(eventLines, trimmed)
+			}
+		}
+		if readErr == nil {
+			continue
+		}
+		if errors.Is(readErr, io.EOF) {
+			if len(eventLines) > 0 {
+				decision, decisionErr := classifyStartupSSEEvent(eventLines)
+				if decisionErr != nil {
+					_ = response.Body.Close()
+					return ChatStreamResponse{}, decisionErr
+				}
+				if decision == startupEventAccept {
+					response.Body = &prefixedReadCloser{
+						Reader: io.MultiReader(bytes.NewReader(captured.Bytes()), reader),
+						Closer: response.Body,
+					}
+					return response, nil
+				}
+			}
+			_ = response.Body.Close()
+			return ChatStreamResponse{}, errors.New("upstream stream ended before first meaningful event")
+		}
+		_ = response.Body.Close()
+		return ChatStreamResponse{}, readErr
+	}
+}
+
+type startupEventDecision int
+
+const (
+	startupEventSkip startupEventDecision = iota
+	startupEventAccept
+)
+
+func classifyStartupSSEEvent(lines []string) (startupEventDecision, error) {
+	if len(lines) == 0 {
+		return startupEventSkip, nil
+	}
+	dataValues := make([]string, 0)
+	for _, line := range lines {
+		if strings.HasPrefix(line, ":") {
+			continue
+		}
+		if !strings.HasPrefix(strings.ToLower(line), "data:") {
+			continue
+		}
+		value := strings.TrimSpace(line[len("data:"):])
+		dataValues = append(dataValues, value)
+	}
+	if len(dataValues) == 0 {
+		return startupEventSkip, nil
+	}
+	if len(dataValues) == 1 && dataValues[0] == "[DONE]" {
+		return startupEventAccept, nil
+	}
+	payload := strings.Join(dataValues, "\n")
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
+		return startupEventAccept, nil
+	}
+	errorValue, hasError := decoded["error"]
+	if !hasError || errorValue == nil {
+		return startupEventAccept, nil
+	}
+	if errorMap, ok := errorValue.(map[string]any); ok {
+		message := strings.TrimSpace(fmt.Sprint(errorMap["message"]))
+		if message != "" && !strings.EqualFold(message, "<nil>") {
+			return startupEventSkip, fmt.Errorf("upstream startup stream error: %s", message)
+		}
+	}
+	return startupEventSkip, errors.New("upstream startup stream error")
+}
+
+type prefixedReadCloser struct {
+	io.Reader
+	io.Closer
 }
 
 func (r *Router) rankModelsForTier(tier domain.Tier, estimatedInputTokens int) []string {

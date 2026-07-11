@@ -167,6 +167,7 @@ func (p *OpenAIProvider) ChatCompletionsStream(ctx context.Context, req app.Chat
 		return app.ChatStreamResponse{}, err
 	}
 	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "text/event-stream")
 	if p.apiKey != "" {
 		request.Header.Set("Authorization", "Bearer "+p.apiKey)
 	}

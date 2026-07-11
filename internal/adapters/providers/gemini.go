@@ -161,8 +161,13 @@ func (p *GeminiProvider) ChatCompletionsStream(ctx context.Context, req app.Chat
 		created := time.Now().Unix()
 		id := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 		wroteRole := false
+		emittedEvent := false
 		for chunk, err := range stream {
 			if err != nil {
+				if !emittedEvent {
+					_ = writer.CloseWithError(fmt.Errorf("upstream startup stream error: %w", err))
+					return
+				}
 				_ = writeSSE(writer, map[string]any{"error": map[string]any{"message": err.Error(), "type": "invalid_request_error"}})
 				_, _ = io.WriteString(writer, "data: [DONE]\n\n")
 				return
@@ -185,6 +190,7 @@ func (p *GeminiProvider) ChatCompletionsStream(ctx context.Context, req app.Chat
 				if err := writeSSE(writer, roleChunk); err != nil {
 					return
 				}
+				emittedEvent = true
 				wroteRole = true
 			}
 
@@ -217,14 +223,15 @@ func (p *GeminiProvider) ChatCompletionsStream(ctx context.Context, req app.Chat
 					if err := writeSSE(writer, textChunk); err != nil {
 						return
 					}
+					emittedEvent = true
 				}
 				if part.FunctionCall != nil {
 					arguments, _ := json.Marshal(part.FunctionCall.Args)
 					idx := toolCallIndex
 					parts = append(parts, app.OpenAIChatToolCall{
 						Index: &idx,
-						ID:   part.FunctionCall.ID,
-						Type: "function",
+						ID:    part.FunctionCall.ID,
+						Type:  "function",
 						Function: app.OpenAIChatToolFunction{
 							Name:      part.FunctionCall.Name,
 							Arguments: string(arguments),
@@ -251,6 +258,7 @@ func (p *GeminiProvider) ChatCompletionsStream(ctx context.Context, req app.Chat
 				if err := writeSSE(writer, toolChunk); err != nil {
 					return
 				}
+				emittedEvent = true
 			}
 
 			finishReason := geminiFinishReasonToOpenAI(candidate.FinishReason)
@@ -271,6 +279,7 @@ func (p *GeminiProvider) ChatCompletionsStream(ctx context.Context, req app.Chat
 			if err := writeSSE(writer, stopChunk); err != nil {
 				return
 			}
+			emittedEvent = true
 		}
 		_, _ = io.WriteString(writer, "data: [DONE]\n\n")
 	}()
@@ -514,8 +523,8 @@ func geminiResponseToOpenAI(model string, response *genai.GenerateContentRespons
 					idx := toolCallIndex
 					toolCall := app.OpenAIChatToolCall{
 						Index: &idx,
-						ID:   part.FunctionCall.ID,
-						Type: "function",
+						ID:    part.FunctionCall.ID,
+						Type:  "function",
 						Function: app.OpenAIChatToolFunction{
 							Name:      part.FunctionCall.Name,
 							Arguments: string(arguments),
